@@ -26,10 +26,11 @@ using Plots
 # make up some binary choice data
     Random.seed!(123)
 
-    n = 10000
+    n = 5000
 
     choices_df = DataFrame(
         uniqueid = 1:n,
+        clusterid = Int64.(ceil.((1:n) ./ 10)),
         dur1 = rand(Exponential(1), n),
         dur2 = rand(Exponential(1), n),
         total_pay1 = rand(Uniform(0, 10), n),
@@ -77,6 +78,7 @@ using Plots
         myxs, 
         :pick1,
         theta0,
+        cluster_var=:clusterid,
         nboot=500);
 
     regtable(logit_fit) |> display
