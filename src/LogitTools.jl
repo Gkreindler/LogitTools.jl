@@ -17,7 +17,8 @@ using RegressionTables, StatsAPI, Vcov
 
 export logit2, boot_logit2, regtable
 
-include("functions_logit2.jl")
+include("functions_logit2_estimation.jl")
+include("functions_logit2_inference.jl")
 # include("optimization_backends.jl")
 # include("functions_inference.jl")
 include("functions_regtable.jl")

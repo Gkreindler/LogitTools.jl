@@ -68,7 +68,6 @@ StatsAPI.mss(m::LogitRegModel) = nulldeviance(m) - rss(m)
 dof_fes(m::LogitRegModel) = m.dof_fes
 
 
-# TODO: update this for logit
 function vcov(r::MLEFit)
     if isnothing(r.vcov)
         nparams = length(r.theta_hat)
@@ -76,11 +75,10 @@ function vcov(r::MLEFit)
     else
         # print warnings
         # (r.vcov.method == :bayesian_bootstrap) && (r.vcov.boot_fits.n_errored > 0) && @warn string(r.vcov.boot_fits.n_errored) * " out of " * string(length(r.vcov.boot_fits.errored)) * " bootstrap runs errored completely (no estimation results). Dropping."
-        return r.vcov
+        return r.vcov.V
     end
 end
 
-# TODO: update this for logit
 function vcov_method(r::MLEFit)
     if isnothing(r.vcov) || (r.vcov.method == :simple)
         return Vcov.simple()
@@ -98,7 +96,6 @@ function LogitRegModel(r::MLEFit)
     if isnothing(r.vcov)
         @error "Cannot print table. No vcov estimated yet"
         error("Cannot print table. No vcov estimated yet")
-        # TODO: warning + just print pt estimates
     end
 
     if isnothing(r.theta_names)

@@ -1,4 +1,5 @@
 using Pkg
+# Pkg.activate("./examples/env/")
 Pkg.activate(".")
 Pkg.resolve()
 Pkg.instantiate()
@@ -18,10 +19,14 @@ using Distributions
 
 using Optim
 
+using StatsBase
+
+using Plots
+
 # make up some binary choice data
     Random.seed!(123)
 
-    n = 1000
+    n = 10000
 
     choices_df = DataFrame(
         uniqueid = 1:n,
@@ -55,47 +60,27 @@ using Optim
 
 ### Analysis
     myxs = [:dur, :total_pay, :dist]
-    
+
+    # initial conditions
     theta0 = zeros(length(myxs))
 
-    # @time mym = logit2(data_df, myxs, :y, theta0, weights=:w)
-    # Optim.minimizer(mym) |> display
-
+    # estimate
     logit_fit = logit2(choices_df, myxs, :pick1, theta0)
-    # theta_hat = Optim.minimizer(mym)
 
-    # logit_fit.vcov = Dict(
-    #     :method => :simple,
-    #     :V => zeros(3,3)
-    # )
-    logit_fit.vcov = zeros(3,3)
-    
+    # without variance-covariance matrix
+    # logit_fit.vcov = zeros(3,3)
+    # regtable(logit_fit)
 
-    # LogitTools.LogitRegModel(logit_fit)
+    # bootstrap
+    @time logit_fit.vcov = boot_logit2(
+        choices_df, 
+        myxs, 
+        :pick1,
+        theta0,
+        nboot=500);
 
-    regtable(logit_fit)
+    regtable(logit_fit) |> display
 
-    # @time theta_boot = boot_logit2(
-    #     choices_df, 
-    #     myxs, 
-    #     :pick1,
-    #     theta0,
-    #     nboot=500)
-
-    # percentile(theta_boot[:, 1], [2.5, 97.5])
-
-    # myline = "\n" * lpad("Coefficient", 20, " ") * " | Coef  |  CI 95%"
-    # println(myline)
-    # println("----------------------------------------------")
-    # for i=1:8
-    #     myline = ""
-    #     myline *= lpad(string(myxs[i]), 20, " ")
-    #     myline *= lpad(@sprintf(" %5.2f ", theta_hat[i]), 9, " ")
-
-    #     li, ui = percentile(theta_boot[:, i], [2.5, 97.5])
-
-    #     myline *= lpad(@sprintf("[%5.2f, %5.2f]", li, ui), 14, " ")
-
-    #     println( myline)
-    # end
-
+    percentile(logit_fit.vcov.theta_boot_table[:, 1], [2.5, 97.5]) |> display
+    histogram(logit_fit.vcov.theta_boot_table[:, 1], bins=50) |> display
+    describe(logit_fit.vcov.theta_boot_table[:, 1])
