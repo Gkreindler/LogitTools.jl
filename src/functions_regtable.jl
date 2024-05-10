@@ -94,8 +94,9 @@ function LogitRegModel(r::MLEFit)
     nobs = r.n_obs
 
     if isnothing(r.vcov)
-        @error "Cannot print table. No vcov estimated yet"
-        error("Cannot print table. No vcov estimated yet")
+        @error "No vcov estimated yet. Using zeros for vcov matrix."
+        # @error "Cannot print table. No vcov estimated yet"
+        # error("Cannot print table. No vcov estimated yet")
     end
 
     if isnothing(r.theta_names)

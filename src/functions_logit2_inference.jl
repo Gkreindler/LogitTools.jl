@@ -1,13 +1,13 @@
-Base.@kwdef mutable struct MLEvcov
-    method::Symbol
-    V  = nothing
-    theta_boot_table 
-    boot_fits = nothing
-    # W = nothing
-    # J = nothing
-    # Σ = nothing
-    # boot_fits_dict = nothing
-end
+# Base.@kwdef mutable struct MLEvcov
+#     method::Symbol
+#     V  = nothing
+#     theta_boot_table 
+#     boot_fits = nothing
+#     # W = nothing
+#     # J = nothing
+#     # Σ = nothing
+#     # boot_fits_dict = nothing
+# end
 
 """
 Generate nboot columns with bayesian bootstrap weights, optionally clustering by cluster_var
