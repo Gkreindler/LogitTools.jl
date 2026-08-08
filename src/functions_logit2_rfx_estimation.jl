@@ -401,3 +401,237 @@ function _rfx_fg!(F, G, θ::Vector{Float64}, P::RfxPrep, buf::RfxBuffers,
 
     return F !== nothing ? Q : nothing
 end
+
+
+# ----------------------------------------------------------------------------
+# ESS diagnostic
+# ----------------------------------------------------------------------------
+
+"""
+    _rfx_ess(θ, P, buf) -> Vector{Float64}
+
+Effective number of draws per group at `θ`:  `ESS_i = 1 / Σ_r τ_ir²`.
+
+A long panel concentrates the posterior over `η_i`, so many draws contribute
+nothing. This is the real risk at large `T_i`.
+"""
+function _rfx_ess(θ::Vector{Float64}, P::RfxPrep, buf::RfxBuffers)
+
+    K, M, R = P.K, P.M, P.R
+    β = view(θ, 1:K)
+    σ = view(θ, K+1:K+M)
+
+    ess = Vector{Float64}(undef, P.N)
+
+    @inbounds for i in 1:P.N
+        rng = P.ranges[i]
+        Ti  = length(rng)
+
+        Xi = view(P.xmatrix, rng, :)
+        Zi = view(P.zmatrix, rng, :)
+        qi = view(P.q,       rng)
+        ηi = view(P.eta, :, :, i)
+
+        Vi = view(buf.V, 1:Ti, :)
+        xb = view(buf.xb, 1:Ti)
+
+        mul!(xb, Xi, β)
+        if M > 0
+            buf.A .= σ .* ηi
+            mul!(Vi, Zi, buf.A)
+            Vi .+= xb
+        else
+            Vi .= xb
+        end
+
+        buf.ll .= P.logw
+        for r in 1:R, t in 1:Ti
+            buf.ll[r] += -log1pexp(-(qi[t] * Vi[t, r]))
+        end
+
+        lse = logsumexp(buf.ll)
+        buf.pw .= exp.(buf.ll .- lse)
+        ess[i] = 1.0 / sum(abs2, buf.pw)
+    end
+
+    return ess
+end
+
+
+# ----------------------------------------------------------------------------
+# Estimation
+# ----------------------------------------------------------------------------
+
+"""
+    _logit2_rfx(P, theta0, gw, optim_options) -> MLEFit
+
+Inner estimation routine: takes a prepped `RfxPrep`, so the bootstrap can reuse
+prep and vary only the group weights `gw`.
+
+Canonicalises `σ ≥ 0` at the source, so that every path — the main fit and every
+bootstrap replicate — returns a canonical sign. Without this, `cov(theta_boot_table)`
+would mix the `2^M` mirror modes and be meaningless.
+
+Never throws: on failure returns an `MLEFit` with `errored = true`, so a single
+bad bootstrap replicate cannot take the whole run down.
+"""
+function _logit2_rfx(
+        P::RfxPrep,
+        theta0::Vector{Float64},
+        gw::Union{Nothing, Vector{Float64}},
+        optim_options::Optim.Options = Optim.Options())
+
+    npar = P.K + P.M
+
+    local myfit
+    try
+        buf = RfxBuffers(P)
+
+        fg! = (F, G, θ) -> _rfx_fg!(F, G, θ, P, buf, gw)
+
+        time_it_took = @elapsed opt = optimize(
+            Optim.only_fg!(fg!), copy(theta0), LBFGS(), optim_options)
+
+        # mirror-mode canonicalisation, at the source
+        th = copy(Optim.minimizer(opt))
+        th[P.K+1:end] .= abs.(th[P.K+1:end])
+
+        # ESS diagnostic at the fitted parameter
+        ess = P.M > 0 ? _rfx_ess(th, P, buf) : fill(Float64(P.R), P.N)
+        ess_min    = minimum(ess)
+        ess_p10    = quantile(ess, 0.10)
+        ess_median = median(ess)
+        ess_mean   = mean(ess)
+
+        Ti = length.(P.ranges)
+
+        myfit = MLEFit(
+            theta0      = theta0,
+            theta_hat   = th,
+            theta_names = P.theta_names,
+            n_obs       = size(P.xmatrix, 1),
+            weights     = gw,
+            obj_value   = Optim.minimum(opt),
+            converged   = Optim.converged(opt),
+            iterations  = Optim.iterations(opt),
+            iteration_limit_reached = Optim.iteration_limit_reached(opt),
+            time_it_took = time_it_took,
+            extra = (; n_groups = P.N, K = P.K, M = P.M, R = P.R,
+                       col_id = P.col_id, rfx = P.rfx_pairs, seed = P.seed,
+                       ess_min = ess_min, ess_p10 = ess_p10,
+                       ess_median = ess_median, ess_mean = ess_mean,
+                       Ti_min = minimum(Ti), Ti_median = median(Ti),
+                       Ti_max = maximum(Ti))
+        )
+
+    catch e
+        myfit = MLEFit(
+            theta0      = theta0,
+            theta_hat   = fill(NaN, npar),
+            theta_names = P.theta_names,
+            n_obs       = size(P.xmatrix, 1),
+            weights     = gw,
+            obj_value   = NaN,
+            errored     = true,
+            error_message = sprint(showerror, e),
+            converged   = false,
+            iterations  = missing,
+            iteration_limit_reached = missing,
+            time_it_took = missing
+        )
+    end
+
+    return myfit
+end
+
+"""
+    logit2_rfx(data_df, formula, choice, col_id, theta0; kwargs...) -> MLEFit
+
+Binary logit with independent normal random coefficients, estimated by maximum
+simulated likelihood with an analytic gradient.
+
+`col_id` is positional because the model is undefined without it (mirrors `mlogit`).
+`rfx` is a keyword because two adjacent positional `Vector{Symbol}` arguments are
+too easy to transpose silently.
+
+# Arguments
+- `data_df`: a `DataFrame`. **Not mutated.**
+- `formula`: `Vector{Symbol}` of regressors, as in `logit2`.
+- `choice`: the 0/1 outcome column.
+- `col_id`: group (individual) identifier for the random coefficients.
+- `theta0`: starting values, length `K + M`. See [`theta0_rfx`](@ref).
+
+# Keywords
+- `rfx = Symbol[]`: subset of `formula` carrying random coefficients. Also accepts
+  `[:dur => :normal]` form; only `:normal` is implemented.
+- `ndraws = 1000`: number of simulation draws, must be even (antithetic pairing).
+- `seed = 20260808`: draw seed. Draws are generated once and reused for every
+  function evaluation, so the objective is a deterministic function of θ.
+- `weights = nothing`: column name; must be constant within `col_id`.
+- `optim_options = Optim.Options()`.
+
+# Parameter ordering
+`θ = [β (K, in formula order); σ (M, in the order listed in rfx)]`, named
+`[formula...; "sd_" .* rfx...]`.
+
+Returned `σ` is always `≥ 0`: the likelihood satisfies `Q(β, σ) = Q(β, -σ)`, so
+there are `2^M` mirror optima and the sign is not identified.
+
+`fit.extra` carries `n_groups`, `K`, `M`, `R`, `col_id`, `rfx`, `seed`, the ESS
+diagnostic (`ess_min`, `ess_p10`, `ess_median`, `ess_mean`) and the panel shape
+(`Ti_min`, `Ti_median`, `Ti_max`).
+
+# Example
+```julia
+theta0 = theta0_rfx(myxs, [:dur, :dist]; b0 = logit_fit.theta_hat)
+fit = logit2_rfx(df, myxs, :pick1, :personid, theta0; rfx = [:dur, :dist])
+```
+"""
+function logit2_rfx(
+        data_df,
+        formula,
+        choice,
+        col_id::Symbol,
+        theta0;
+        rfx = Symbol[],
+        ndraws::Int = 1000,
+        seed::Int = 20260808,
+        weights::Union{Nothing, Symbol, String} = nothing,
+        optim_options::Optim.Options = Optim.Options())
+
+    P, gw = _prep_logit2_rfx(data_df, formula, choice, col_id, rfx,
+                             ndraws, seed, weights)
+
+    theta0 = _check_theta0_rfx(theta0, P)
+
+    myfit = _logit2_rfx(P, theta0, gw, optim_options)
+
+    if !myfit.errored && P.M > 0 && myfit.extra.ess_p10 < 30
+        @warn "10th-percentile effective number of draws is " *
+              "$(round(myfit.extra.ess_p10, digits=1)) (< 30): the posterior over the " *
+              "random coefficients is concentrated relative to the draw set. " *
+              "Consider increasing ndraws (currently $(P.R))."
+    end
+
+    return myfit
+end
+
+"""Validate `theta0` against a prepped model."""
+function _check_theta0_rfx(theta0, P::RfxPrep)
+    th = Float64.(collect(theta0))
+    npar = P.K + P.M
+
+    length(th) == npar || error(
+        "theta0 has length $(length(th)) but the model has K + M = $(P.K) + $(P.M) = " *
+        "$npar parameters. Use theta0_rfx(formula, rfx) to assemble it.")
+
+    if P.M > 0 && any(th[P.K+1:end] .== 0)
+        bad = findall(th[P.K+1:end] .== 0)
+        error("theta0 has σ = 0 for rfx variable(s) " *
+              "$(first.(P.rfx_pairs)[bad]): σ = 0 is a stationary point (a saddle) of " *
+              "the simulated likelihood, so the optimiser cannot move away from it. " *
+              "Use a nonzero start such as 0.5.")
+    end
+
+    return th
+end
