@@ -23,7 +23,7 @@ export mlogit, boot_mlogit,
        logit2, boot_logit2,
        regtable
 
-export logit2_rfx, boot_logit2_rfx, theta0_rfx, boot_report, boot_vcov!
+export logit2_rfx, boot_logit2_rfx, theta0_rfx, boot_report, boot_vcov!, regtable_rfx
 
 include("MLE_objects.jl")
 
