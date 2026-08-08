@@ -2,5 +2,5 @@ using LogitTools
 using Test
 
 @testset "LogitTools.jl" begin
-    # Write your tests here.
+    include("test_logit2_rfx.jl")
 end
