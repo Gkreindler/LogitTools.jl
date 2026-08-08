@@ -303,6 +303,37 @@ end
     end
 
     # -----------------------------------------------------------------------
+    @testset "boot_report fallback and failure handling" begin
+        df = _rfx_testdata(N = 60, T = 6, K = 3, seed = 21, beta = [0.6, -0.9, 0.4],
+                           sigma_true = [0.7, 0.4], rfx_idx = [1, 3])
+        myxs = [:x1, :x2, :x3]
+        th0  = theta0_rfx(myxs, [:x1, :x3])
+
+        fit = logit2_rfx(df, myxs, :pick1, :personid, th0;
+                         rfx = [:x1, :x3], ndraws = 100, seed = 7)
+        fit.vcov = boot_logit2_rfx(df, myxs, :pick1, :personid, th0;
+                                   rfx = [:x1, :x3], ndraws = 100, seed = 7,
+                                   nboot = 20, boot_seed = 777, parallel = false,
+                                   theta_start = fit.theta_hat)
+
+        # a run reloaded from disk with only the table: warn once, fall back to
+        # all non-NaN rows
+        fit.vcov.boot_fits = nothing
+        rep = (@test_logs (:warn,) match_mode = :any boot_report(fit))
+        @test nrow(rep) == 5
+        @test all(isfinite, rep.boot_se)
+
+        # errored replicates keep their row (as NaN) but are excluded from V
+        tbl = fit.vcov.theta_boot_table
+        tbl[3, :] .= NaN
+        keep = [all(isfinite, view(tbl, b, :)) for b in 1:size(tbl, 1)]
+        @test sum(keep) == 19
+        boot_vcov!(fit)
+        @test all(isfinite, fit.vcov.V)          # NaN row did not poison V
+        @test size(fit.vcov.V) == (5, 5)
+    end
+
+    # -----------------------------------------------------------------------
     # Guarded: addprocs inside Pkg.test()'s sandbox has to inherit a temporary
     # environment and is a known source of flakiness. This is the single most
     # valuable test for the Distributed plumbing, so it must exist and must be
