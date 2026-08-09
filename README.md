@@ -37,6 +37,18 @@ fit.vcov = boot_logit2(choices_df, myxs, :pick1, zeros(length(myxs));
 regtable(fit)
 ```
 
+The bootstrap runs in parallel with `parallel = true`, which gives bit-for-bit
+identical results to the serial path:
+
+```julia
+using Distributed
+addprocs(4)
+@everywhere using LogitTools
+
+fit.vcov = boot_logit2(choices_df, myxs, :pick1, zeros(length(myxs));
+                       cluster_var = :clusterid, nboot = 500, parallel = true)
+```
+
 ## Worked example: random coefficients
 
 `logit2_rfx` lets coefficients vary across individuals:

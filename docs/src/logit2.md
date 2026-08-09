@@ -51,6 +51,29 @@ cis(fit)                     # percentile confidence intervals
 
 `boot_logit2` appends `bw1 … bwN` weight columns to the DataFrame you pass.
 
+### In parallel
+
+```julia
+using Distributed
+addprocs(4)
+@everywhere using LogitTools          # the one setup step
+
+fit.vcov = boot_logit2(choices_df, myxs, :pick1, zeros(length(myxs));
+                       cluster_var = :clusterid, nboot = 500,
+                       parallel = true)
+```
+
+`parallel = true` and `parallel = false` give **identical** results, bit for bit.
+The Dirichlet weights are drawn once on the master by `bbw!`, exactly as before,
+and both paths then consume the same weight matrix. Workers receive only numeric
+arrays — never the DataFrame — and a `CachingPool` ships the closure once per
+worker rather than once per replicate.
+
+!!! note
+    `parallel` defaults to `false` here, unlike [`boot_logit2_rfx`](@ref) where
+    it defaults to `true`. Existing scripts calling `boot_logit2` keep working
+    unchanged on a single process.
+
 ## Multinomial logit
 
 [`mlogit`](@ref) takes a group identifier and a 0/1 selection column, one row

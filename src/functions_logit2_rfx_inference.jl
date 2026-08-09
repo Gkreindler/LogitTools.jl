@@ -7,32 +7,6 @@
 ###############################################################################
 
 """
-    _check_rfx_workers()
-
-Verify that every worker can see `LogitTools`. Names the offending workers.
-"""
-function _check_rfx_workers()
-    nprocs() > 1 || error(
-        "parallel = true but nprocs() == 1: there are no worker processes. " *
-        "Run addprocs(n) followed by @everywhere using LogitTools, or pass parallel = false.")
-
-    bad = Int[]
-    for w in workers()
-        ok = try
-            remotecall_fetch(() -> isdefined(Main, :LogitTools), w)
-        catch
-            false
-        end
-        ok || push!(bad, w)
-    end
-
-    isempty(bad) || error(
-        "LogitTools is not loaded on worker(s) $bad. Run: @everywhere using LogitTools")
-
-    return nothing
-end
-
-"""
     _rfx_boot_weights(N, nboot, boot_seed) -> Matrix{Float64}
 
 Group-level Bayesian bootstrap (Dirichlet) weights, `N × nboot`, each column
@@ -117,7 +91,7 @@ function boot_logit2_rfx(
 
     # check the cluster before prep, so a misconfigured parallel run fails
     # immediately rather than after prep has already been paid for
-    parallel && _check_rfx_workers()
+    parallel && _check_boot_workers()
 
     # prep once, on the master
     P, gw_user = _prep_logit2_rfx(data_df, formula, choice, col_id, rfx,
