@@ -29,6 +29,26 @@ fit.obj_value     # minus log likelihood at the optimum
 The choice column must contain only `0` and `1`. An optional `weights` keyword
 takes a column name.
 
+### Convergence
+
+`optim_options` is passed straight to `Optim`. The LBFGS default stops after
+1000 iterations, which binds on specifications with many regressors — a
+conditional logit with a full set of neighborhood dummies (`K = 130`) stops at
+the cap and returns `converged = false`:
+
+```julia
+opts = Optim.Options(iterations = 100_000, g_tol = 1e-6)
+
+fit = logit2(df, myxs, :pick1, zeros(length(myxs)); optim_options = opts)
+
+fit.converged                 # check it, do not assume it
+fit.iterations
+fit.iteration_limit_reached
+```
+
+The same keyword is available on `boot_logit2`, where it applies to every
+replicate. Always check `converged` rather than trusting the default.
+
 !!! note
     `logit2` converts the regressor columns to `Float64` **in place** in the
     DataFrame you pass. Pass `copy(df)` if that matters to you.
