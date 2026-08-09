@@ -93,21 +93,23 @@ Estimate a binary logit model with MLE
     formula = vector of 
 """
 function logit2(
-    data_df, 
+    data_df,
     formula, # TODO: replace this with actual formula from StatsAPI
     choice,
-    theta0; 
-    weights::Union{Nothing, Symbol, String}=nothing)
+    theta0;
+    weights::Union{Nothing, Symbol, String}=nothing,
+    optim_options::Optim.Options=Optim.Options())
 
     wvec, xmatrix, yvec, u_comp = _prep_logit2(data_df, formula, choice, weights)
 
     # estimate
     myfit = _logit2(
-            xmatrix=xmatrix, 
-            yvec=yvec, 
+            xmatrix=xmatrix,
+            yvec=yvec,
             u_comp=u_comp,
             theta0=theta0,
-            wvec=wvec)
+            wvec=wvec,
+            optim_options=optim_options)
     
     myfit.theta_names = string.(formula)
 
@@ -118,18 +120,19 @@ end
     the inner function (to not repeat prep when bootstrapping)
 """
 function _logit2(;
-    xmatrix::Matrix{Float64}, 
-    yvec::Vector{Float64}, 
+    xmatrix::Matrix{Float64},
+    yvec::Vector{Float64},
     u_comp::Vector{Float64},
     theta0::Vector{Float64},
-    wvec::Union{Nothing, Vector{Float64}}=nothing)
+    wvec::Union{Nothing, Vector{Float64}}=nothing,
+    optim_options::Optim.Options=Optim.Options())
 
     # define objective function (minus log likelihood)
         f = theta -> minus_ll(theta, yvec, xmatrix, u_comp, wvec)
         g = theta -> minus_grad(theta, yvec, xmatrix, u_comp, wvec)
 
     # estimate
-    time_it_took = @elapsed opt_results = optimize(f, g, theta0, LBFGS(), inplace=false)
+    time_it_took = @elapsed opt_results = optimize(f, g, theta0, LBFGS(), optim_options, inplace=false)
 
     # return an MLEFit object
     return MLEFit(

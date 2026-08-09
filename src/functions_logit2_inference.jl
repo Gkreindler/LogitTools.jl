@@ -93,6 +93,7 @@ function _boot_logit2(
             theta0::Vector{Float64},
             W::Matrix{Float64};
             parallel::Bool=false,
+            optim_options::Optim.Options=Optim.Options(),
             mydebug::Bool=false)
 
     # A fresh scratch buffer per replicate. u_comp is pure scratch (it is
@@ -104,7 +105,8 @@ function _boot_logit2(
         yvec    = yvec,
         u_comp  = similar(yvec),
         theta0  = theta0,
-        wvec    = W[:, b])
+        wvec    = W[:, b],
+        optim_options = optim_options)
 
     # The closure captures xmatrix / yvec / W. CachingPool serialises it once
     # per worker, not once per task; each task then transmits only an Int.
@@ -172,6 +174,9 @@ Bayesian bootstrap for [`logit2`](@ref).
 - `parallel = false`: distribute replicates over `workers()`. Requires
   `addprocs(n)` and `@everywhere using LogitTools`. Defaults to `false` so that
   existing scripts are unaffected.
+- `optim_options = Optim.Options()`: passed to every replicate's `optimize`
+  call. Raise `iterations` for specifications with many regressors (e.g. a full
+  set of fixed-effect dummies), where the default 1000-iteration cap can bind.
 - `mydebug = false`: print per-replicate progress (serial path only).
 
 `parallel = true` and `parallel = false` give **identical** results: the
@@ -198,6 +203,7 @@ function boot_logit2(
     nboot=500,
     cluster_var=nothing,
     parallel::Bool=false,
+    optim_options::Optim.Options=Optim.Options(),
     mydebug=false)
 
     # fail fast on a misconfigured cluster, before any work is done
@@ -213,7 +219,8 @@ function boot_logit2(
     W = _boot_weights_matrix(data_df, nboot)
 
     return _boot_logit2(nboot, xmatrix, yvec, theta0, W;
-                        parallel=parallel, mydebug=mydebug)
+                        parallel=parallel, optim_options=optim_options,
+                        mydebug=mydebug)
 end
 
 

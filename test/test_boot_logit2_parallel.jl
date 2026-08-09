@@ -3,6 +3,7 @@ using Test
 using DataFrames
 using Random
 using Distributions
+using Optim
 using StatsBase
 using Distributed   # top level: @everywhere is expanded at parse time
 
@@ -91,6 +92,37 @@ end
         v = LT._boot_logit2(nboot, xmatrix, yvec, u_comp, zeros(3), df, false)
         @test size(v.theta_boot_table) == (nboot, 3)
         @test v.method == :bayesian_bootstrap
+    end
+
+    # -----------------------------------------------------------------------
+    @testset "optim_options" begin
+        # the default must reproduce the old no-options call exactly
+        d1 = _bl2_testdata(); f1 = logit2(d1, myxs, :pick1, zeros(3))
+        d2 = _bl2_testdata(); f2 = logit2(d2, myxs, :pick1, zeros(3);
+                                          optim_options = Optim.Options())
+        @test f1.theta_hat == f2.theta_hat
+        @test f1.obj_value == f2.obj_value
+        @test f1.iterations == f2.iterations
+
+        d3 = _bl2_testdata(); Random.seed!(5)
+        v1 = boot_logit2(d3, myxs, :pick1, zeros(3); nboot = 10, cluster_var = :clusterid)
+        d4 = _bl2_testdata(); Random.seed!(5)
+        v2 = boot_logit2(d4, myxs, :pick1, zeros(3); nboot = 10, cluster_var = :clusterid,
+                         optim_options = Optim.Options())
+        @test v1.theta_boot_table == v2.theta_boot_table
+
+        # and the options actually reach the optimiser
+        d5 = _bl2_testdata()
+        f3 = logit2(d5, myxs, :pick1, zeros(3);
+                    optim_options = Optim.Options(iterations = 1))
+        @test f3.iterations == 1
+        @test f3.iteration_limit_reached
+        @test !f3.converged
+
+        d6 = _bl2_testdata(); Random.seed!(5)
+        v3 = boot_logit2(d6, myxs, :pick1, zeros(3); nboot = 5, cluster_var = :clusterid,
+                         optim_options = Optim.Options(iterations = 1))
+        @test all(f.iterations == 1 for f in v3.boot_fits)
     end
 
     # -----------------------------------------------------------------------
