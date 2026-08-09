@@ -207,40 +207,191 @@ end
 # Reporting
 # ----------------------------------------------------------------------------
 
-"""
-    regtable_rfx(fit; kwargs...)
+# ---- mixed below-statistic: SE for β rows, percentile CI for σ rows --------
 
-`regtable` for an rfx fit, reporting the covariance type through the existing
-public helper `vcov_method` instead of the hardcoded `Vcov.simple()` that the
-generic `MLEFit` path uses.
-
-This is a separate entry point rather than a change to `functions_regtable.jl`:
-`regtable(fit)` keeps its current behaviour for every existing model.
 """
-function regtable_rfx(fit::MLEFit; kwargs...)
-    m = LogitRegModel(fit)                       # existing constructor, unmodified
-    m_rfx = LogitRegModel(
-        coef        = m.coef,
-        vcov        = m.vcov,
-        vcov_type   = vcov_method(fit),          # <- the public helper
-        esample     = m.esample,
-        fe          = m.fe,
-        fekeys      = m.fekeys,
-        coefnames   = m.coefnames,
-        responsename = m.responsename,
-        contrasts   = m.contrasts,
-        nobs        = m.nobs,
-        dof         = m.dof,
-        dof_fes     = m.dof_fes,
-        dof_residual = m.dof_residual,
-        rss         = m.rss,
-        tss         = m.tss,
-        F           = m.F,
-        p           = m.p,
-        iterations  = m.iterations,
-        converged   = m.converged,
-    )
-    return RegressionTables.regtable(m_rfx; render = AsciiTable(), kwargs...)
+    RfxUnderStat <: RegressionTables.AbstractUnderStatistic
+
+The value printed under a coefficient in [`regtable_rfx`](@ref): a standard error
+for the `β` rows (a scalar) and a percentile confidence interval for the `sd_`
+rows (a pair). RegressionTables' `below_statistic` is otherwise uniform across
+the whole table.
+"""
+struct RfxUnderStat <: RegressionTables.AbstractUnderStatistic
+    val::Union{Float64, Tuple{Float64,Float64}}
+end
+
+# scalar renders like StdError, pair renders like ConfInt
+function Base.repr(render::RegressionTables.AbstractRenderType, x::RfxUnderStat;
+                   digits = RegressionTables.default_digits(render, 0.0), args...)
+    v = x.val
+    s = if v isa Tuple
+        Base.repr(render, v[1]; digits) * ", " * Base.repr(render, v[2]; digits)
+    else
+        Base.repr(render, v; digits, commas = false)
+    end
+    return RegressionTables.below_decoration(render, s)
+end
+
+"""
+    RfxBelowStatistic
+
+Callable passed as `below_statistic`. RegressionTables invokes it as
+`(rr, k)` for coefficient `k` of model `rr`, which is what makes per-row
+dispatch possible. Keyed by model identity so a multi-model table stays correct.
+"""
+struct RfxBelowStatistic
+    tbl::IdDict{Any, NamedTuple{(:is_sd, :se, :ci_lo, :ci_hi),
+                                Tuple{Vector{Bool}, Vector{Float64},
+                                      Vector{Float64}, Vector{Float64}}}}
+end
+
+function (f::RfxBelowStatistic)(rr, k::Int; vargs...)
+    d = f.tbl[rr]
+    return d.is_sd[k] ? RfxUnderStat((d.ci_lo[k], d.ci_hi[k])) :
+                        RfxUnderStat(d.se[k])
+end
+
+"""Per-parameter SEs and percentile CIs for one fit."""
+function _rfx_table_stats(fit::MLEFit, ci_levels)
+    npar = length(fit.theta_hat)
+    e = fit.extra
+    K = isnothing(e) ? npar : e.K
+    is_sd = [j > K for j in 1:npar]
+
+    V  = vcov(fit)
+    se = [sqrt(max(V[j, j], 0.0)) for j in 1:npar]
+
+    ci_lo = fill(NaN, npar)
+    ci_hi = fill(NaN, npar)
+    if !isnothing(fit.vcov) && !isnothing(fit.vcov.theta_boot_table)
+        nbootpar = size(fit.vcov.theta_boot_table, 2)
+        nbootpar == npar || error(
+            "theta_boot_table has $nbootpar columns but the fit has $npar parameters. " *
+            "This vcov belongs to a different model.")
+        keep = _boot_keep_rows(fit)
+        if sum(keep) >= 2
+            kept = fit.vcov.theta_boot_table[keep, :]
+            for j in 1:npar
+                ci_lo[j] = percentile(view(kept, :, j), ci_levels[1])
+                ci_hi[j] = percentile(view(kept, :, j), ci_levels[2])
+            end
+        end
+    end
+
+    return (; is_sd, se, ci_lo, ci_hi)
+end
+
+"""
+    regtable_rfx(fits::MLEFit...; ci_for_sd = true, ci_levels = [2.5, 97.5], kwargs...)
+
+`regtable` for random-coefficient fits, with two differences from the generic
+`MLEFit` path:
+
+1. The covariance type is reported through the public `vcov_method` helper
+   rather than the hardcoded `Vcov.simple()`.
+2. With `ci_for_sd = true` (the default) the `sd_` rows print a **percentile
+   confidence interval** from the bootstrap replicates, while the `β` rows keep
+   their standard error.
+
+The second point is the statistically meaningful one. Because `σ`'s sign is not
+identified, estimates are canonicalised with `abs()`, which folds the sampling
+distribution and makes it skewed — so a symmetric `±1.96·se` interval is the
+wrong summary for those rows, increasingly so the closer `σ` sits to zero. The
+percentile interval is taken directly from the replicates and stays inside the
+parameter space.
+
+Pass `ci_for_sd = false` for a conventional table with standard errors
+throughout. Any other keyword is forwarded to `regtable`.
+
+!!! note
+    `ci_for_sd = true` needs RegressionTables 0.7 or newer, which is the first
+    version whose `below_statistic` receives the coefficient index and so can
+    vary by row. On 0.6.x this throws with an explanatory message; use
+    `ci_for_sd = false` there.
+
+# Example
+```julia
+fit.vcov = boot_logit2_rfx(df, myxs, :pick1, :personid, theta0; rfx = myrfx)
+regtable_rfx(fit)                       # SE under β, 95% CI under sd_
+regtable_rfx(fit; ci_levels = [5, 95])  # 90% interval
+```
+"""
+function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
+                      ci_levels = [2.5, 97.5], kwargs...)
+
+    isempty(fits) && error("regtable_rfx needs at least one MLEFit")
+
+    models = LogitRegModel[]
+    stats  = IdDict{Any, NamedTuple{(:is_sd, :se, :ci_lo, :ci_hi),
+                                    Tuple{Vector{Bool}, Vector{Float64},
+                                          Vector{Float64}, Vector{Float64}}}}()
+
+    for fit in fits
+        m = LogitRegModel(fit)                   # existing constructor, unmodified
+        m_rfx = LogitRegModel(
+            coef        = m.coef,
+            vcov        = m.vcov,
+            vcov_type   = vcov_method(fit),      # <- the public helper
+            esample     = m.esample,
+            fe          = m.fe,
+            fekeys      = m.fekeys,
+            coefnames   = m.coefnames,
+            responsename = m.responsename,
+            contrasts   = m.contrasts,
+            nobs        = m.nobs,
+            dof         = m.dof,
+            dof_fes     = m.dof_fes,
+            dof_residual = m.dof_residual,
+            rss         = m.rss,
+            tss         = m.tss,
+            F           = m.F,
+            p           = m.p,
+            iterations  = m.iterations,
+            converged   = m.converged,
+        )
+        push!(models, m_rfx)
+        stats[m_rfx] = _rfx_table_stats(fit, ci_levels)
+    end
+
+    if !ci_for_sd
+        return RegressionTables.regtable(models...; render = AsciiTable(), kwargs...)
+    end
+
+    _rfx_check_below_statistic_api()
+
+    any_sd = any(any(stats[m].is_sd) for m in models)
+    if !any_sd
+        # nothing to vary; keep the plain table rather than a pointless indirection
+        return RegressionTables.regtable(models...; render = AsciiTable(), kwargs...)
+    end
+
+    for m in models
+        d = stats[m]
+        if any(d.is_sd) && !all(isfinite, d.ci_lo[d.is_sd])
+            error("regtable_rfx(ci_for_sd = true) needs bootstrap replicates for the " *
+                  "sd_ rows, but this fit has no usable theta_boot_table. Run " *
+                  "boot_logit2_rfx first, or pass ci_for_sd = false.")
+        end
+    end
+
+    return RegressionTables.regtable(models...;
+                                     render = AsciiTable(),
+                                     below_statistic = RfxBelowStatistic(stats),
+                                     kwargs...)
+end
+
+"""Feature-detect the RegressionTables API that per-row below statistics need."""
+function _rfx_check_below_statistic_api()
+    ok = hasmethod(RegressionTables.StdError,
+                   Tuple{RegressionTables.RegressionModel, Int})
+    ok || error(
+        "regtable_rfx(ci_for_sd = true) requires RegressionTables 0.7 or newer: " *
+        "older versions call below_statistic with (se, coef, dof) and no coefficient " *
+        "index, so the statistic cannot vary by row. Installed version is " *
+        "$(pkgversion(RegressionTables)). Upgrade RegressionTables, or call " *
+        "regtable_rfx(fit; ci_for_sd = false).")
+    return nothing
 end
 
 """

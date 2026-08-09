@@ -161,7 +161,35 @@ Bayesian bootstrap for logit2_rfx
 
 All five true values fall inside their 95% percentile intervals.
 
-`regtable(fit)` still works, since `logit2_rfx` returns an ordinary `MLEFit`:
+`regtable_rfx(fit)` prints a **95% percentile CI under the `sd_` rows** and keeps
+standard errors under the `β` rows:
+
+```
+----------------------
+dur           -0.151***
+                (0.040)
+total_pay      0.106***
+                (0.025)
+dist          -0.262***
+                (0.032)
+sd_dur         0.646***
+         (0.571, 0.709)
+sd_dist        0.370***
+         (0.294, 0.464)
+----------------------
+N                  8,400
+----------------------
+```
+
+```julia
+regtable_rfx(fit; ci_levels = [5, 95])   # 90% interval
+regtable_rfx(fit; ci_for_sd = false)     # standard errors throughout
+```
+
+(Needs RegressionTables 0.7+; `ci_for_sd = false` works on any version.)
+
+Plain `regtable(fit)` also still works, since `logit2_rfx` returns an ordinary
+`MLEFit`:
 
 ```
 ---------------------

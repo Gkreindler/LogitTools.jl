@@ -193,9 +193,51 @@ homogeneity is rejected.
     ``\tfrac12\chi^2_0 + \tfrac12\chi^2_1`` mixture). Read such an interval as
     "cannot reject homogeneity", not as a calibrated interval.
 
+### Tables
+
 `regtable(fit)` still works, since `logit2_rfx` returns an ordinary `MLEFit`.
-[`regtable_rfx`](@ref) is the same table with the covariance type reported
-through `vcov_method`.
+
+[`regtable_rfx`](@ref) additionally prints a **percentile confidence interval
+under the `sd_` rows** while keeping standard errors under the `β` rows, which is
+the presentation the previous paragraph argues for:
+
+```julia
+regtable_rfx(fit)
+```
+
+```
+----------------------
+x1            0.601***
+               (0.152)
+x2           -0.895***
+               (0.133)
+x3            0.512***
+               (0.096)
+sd_x1         0.852***
+        (0.619, 1.084)
+sd_x3            0.077
+        (0.003, 0.560)
+----------------------
+N                  640
+----------------------
+```
+
+`sd_x3` shows why it matters: an estimate of `0.077` with a bootstrap standard
+error of `0.170` gives a Wald interval of `(-0.256, 0.410)`, mostly outside the
+parameter space, while the percentile interval `(0.003, 0.560)` does not.
+
+```julia
+regtable_rfx(fit; ci_levels = [5, 95])   # 90% interval
+regtable_rfx(fit; ci_for_sd = false)     # conventional: standard errors throughout
+regtable_rfx(fit1, fit2)                 # several models, each with its own CIs
+```
+
+Other keywords (`render = LatexTable()`, `labels`, …) are forwarded to `regtable`.
+
+!!! note
+    `ci_for_sd = true` needs RegressionTables 0.7 or newer — the first version
+    whose `below_statistic` receives the coefficient index, and so can vary by
+    row. On 0.6.x it throws an explanatory error; use `ci_for_sd = false`.
 
 ## Guards
 

@@ -7,6 +7,7 @@ using LinearAlgebra
 using Statistics
 using FiniteDiff
 using Optim
+using RegressionTables
 using Distributed   # top level: @everywhere is expanded at parse time
 
 const LT = LogitTools
@@ -304,6 +305,69 @@ end
     end
 
     # -----------------------------------------------------------------------
+    @testset "regtable_rfx mixed SE / CI" begin
+        df = _rfx_testdata(N = 60, T = 6, K = 3, seed = 21, beta = [0.6, -0.9, 0.4],
+                           sigma_true = [0.7, 0.4], rfx_idx = [1, 3])
+        myxs = [:x1, :x2, :x3]
+        th0  = theta0_rfx(myxs, [:x1, :x3])
+
+        fit = logit2_rfx(df, myxs, :pick1, :personid, th0;
+                         rfx = [:x1, :x3], ndraws = 100, seed = 7)
+        fit.vcov = boot_logit2_rfx(df, myxs, :pick1, :personid, th0;
+                                   rfx = [:x1, :x3], ndraws = 100, seed = 7,
+                                   nboot = 20, boot_seed = 777, parallel = false,
+                                   theta_start = fit.theta_hat)
+
+        # ci_for_sd = false works on every RegressionTables version
+        @test regtable_rfx(fit; ci_for_sd = false) !== nothing
+
+        has_api = hasmethod(RegressionTables.StdError,
+                            Tuple{RegressionTables.RegressionModel, Int})
+        if has_api
+            @test regtable_rfx(fit) !== nothing
+            @test regtable_rfx(fit; ci_levels = [5, 95]) !== nothing
+
+            # the printed CI must equal boot_report's percentile CI
+            rep = boot_report(fit)
+            st  = LT._rfx_table_stats(fit, [2.5, 97.5])
+            @test st.is_sd == [false, false, false, true, true]
+            @test st.ci_lo ≈ rep.ci_lo
+            @test st.ci_hi ≈ rep.ci_hi
+            @test st.se   ≈ rep.boot_se          # sqrt(diag(V)) == std of replicates
+
+            # the under-statistic dispatches per row
+            bs = LT.RfxBelowStatistic(IdDict{Any, NamedTuple{(:is_sd, :se, :ci_lo, :ci_hi),
+                    Tuple{Vector{Bool}, Vector{Float64}, Vector{Float64}, Vector{Float64}}}}())
+            m = LogitTools.LogitRegModel(fit)
+            bs.tbl[m] = st
+            @test bs(m, 1).val isa Float64            # beta row -> scalar SE
+            @test bs(m, 4).val isa Tuple              # sd_ row  -> pair
+            @test bs(m, 4).val == (st.ci_lo[4], st.ci_hi[4])
+            @test bs(m, 1).val ≈ st.se[1]
+
+            # several fits in one table
+            @test regtable_rfx(fit, fit) !== nothing
+
+            # a fit with no bootstrap cannot produce percentile CIs
+            nb = logit2_rfx(df, myxs, :pick1, :personid, th0;
+                            rfx = [:x1, :x3], ndraws = 100, seed = 7)
+            @test_throws ErrorException regtable_rfx(nb)
+            @test regtable_rfx(nb; ci_for_sd = false) !== nothing
+        end
+
+        # an M = 0 fit has no sd_ rows: falls back to the plain table
+        f0 = logit2_rfx(df, myxs, :pick1, :personid, zeros(3); rfx = Symbol[], ndraws = 10)
+        f0.vcov = boot_logit2_rfx(df, myxs, :pick1, :personid, zeros(3);
+                                  rfx = Symbol[], ndraws = 10, nboot = 20,
+                                  boot_seed = 777, parallel = false)
+        @test regtable_rfx(f0) !== nothing
+
+        # a vcov from a different model is caught with a clear message
+        f0bad = logit2_rfx(df, myxs, :pick1, :personid, zeros(3); rfx = Symbol[], ndraws = 10)
+        f0bad.vcov = fit.vcov                       # 5 params vs 3
+        @test_throws ErrorException LT._rfx_table_stats(f0bad, [2.5, 97.5])
+    end
+
     @testset "rethrow_errors" begin
         df = _rfx_testdata(N = 40, T = 5, K = 3, seed = 21, beta = [0.6, -0.9, 0.4],
                            sigma_true = [0.7, 0.4], rfx_idx = [1, 3])
