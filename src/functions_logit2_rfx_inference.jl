@@ -69,6 +69,10 @@ coefficient group) level.
   `addprocs(n)` and `@everywhere using LogitTools`.
 - `theta_start = nothing`: warm start; defaults to `theta0`. Passing the main
   fit's `theta_hat` is usually much faster.
+- `rethrow_errors = false`: by default a replicate that throws is captured as
+  `errored` and the run continues. Set `true` to let the first exception
+  propagate with its stacktrace. When replicates are failing, re-run with
+  `parallel = false, nboot = 1, rethrow_errors = true` for a readable error.
 - `mydebug = false`: print per-replicate progress (serial path only).
 
 # Notes
@@ -100,6 +104,7 @@ function boot_logit2_rfx(
         parallel::Bool = true,
         theta_start = nothing,
         optim_options::Optim.Options = Optim.Options(),
+        rethrow_errors::Bool = false,
         mydebug::Bool = false)
 
     if !isnothing(cluster_var) && Symbol(cluster_var) != col_id
@@ -129,7 +134,8 @@ function boot_logit2_rfx(
 
     # The closure captures P (design matrices + draws) and Wfull. CachingPool
     # serialises it once per worker; each task then transmits only an Int.
-    task = b -> _logit2_rfx(P, th_start, Vector{Float64}(view(Wfull, :, b)), optim_options)
+    task = b -> _logit2_rfx(P, th_start, Vector{Float64}(view(Wfull, :, b)), optim_options;
+                            rethrow_errors = rethrow_errors)
 
     fits = if parallel
         pmap(task, CachingPool(workers()), 1:nboot)
@@ -160,13 +166,32 @@ function _assemble_rfx_boot(fits, P::RfxPrep, nboot::Int)
     keep = [(!f.errored) && f.converged for f in fits]
     nkeep = sum(keep)
 
-    nkeep >= 2 || error(
-        "only $nkeep of $nboot bootstrap replicates converged; cannot compute a " *
-        "covariance matrix. Check the starting values and optim_options.")
+    # Separate the two failure modes: they have completely different fixes.
+    nerr    = count(f -> f.errored, fits)
+    noconv  = count(f -> (!f.errored) && (!f.converged), fits)
+
+    if nkeep < 2
+        msg = "only $nkeep of $nboot bootstrap replicates were usable " *
+              "($nerr errored, $noconv ran but did not converge); " *
+              "cannot compute a covariance matrix.\n"
+        if nerr > 0
+            firsterr = fits[findfirst(f -> f.errored, fits)].error_message
+            msg *= "First error was:\n    " * replace(firsterr, "\n" => "\n    ") * "\n" *
+                   "Re-run with rethrow_errors = true to get the full stacktrace."
+        else
+            msg *= "Nothing threw, so this is an optimiser problem: try a better " *
+                   "theta_start (e.g. the main fit's theta_hat), or raise the " *
+                   "iteration limit via optim_options = Optim.Options(iterations = 5_000)."
+        end
+        error(msg)
+    end
 
     if nkeep < nboot
         @warn "$(nboot - nkeep) of $nboot bootstrap replicates were dropped " *
-              "(errored or did not converge); V is computed from the remaining $nkeep."
+              "($nerr errored, $noconv did not converge); " *
+              "V is computed from the remaining $nkeep." *
+              (nerr > 0 ? "\nFirst error: " *
+                          first(split(fits[findfirst(f -> f.errored, fits)].error_message, "\n")) : "")
     end
 
     return MLEvcov(

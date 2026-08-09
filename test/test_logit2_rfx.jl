@@ -6,6 +6,7 @@ using Distributions
 using LinearAlgebra
 using Statistics
 using FiniteDiff
+using Optim
 using Distributed   # top level: @everywhere is expanded at parse time
 
 const LT = LogitTools
@@ -300,6 +301,63 @@ end
         @test regtable(fit) !== nothing                           # still renders
         @test regtable_rfx(fit) !== nothing
         @test LT.vcov_method(fit) isa LT.bayesian_bootstrap
+    end
+
+    # -----------------------------------------------------------------------
+    @testset "rethrow_errors" begin
+        df = _rfx_testdata(N = 40, T = 5, K = 3, seed = 21, beta = [0.6, -0.9, 0.4],
+                           sigma_true = [0.7, 0.4], rfx_idx = [1, 3])
+        myxs = [:x1, :x2, :x3]
+        th0  = theta0_rfx(myxs, [:x1, :x3])
+
+        P, _ = LT._prep_logit2_rfx(df, myxs, :pick1, :personid, [:x1, :x3], 50, 7, nothing)
+        # poison the draws so the kernel throws
+        Pbad = LT.RfxPrep(P.xmatrix, P.zmatrix, P.yvec, P.q, P.ranges,
+                          fill(NaN, size(P.eta)), P.logw, P.group_ids,
+                          P.K, P.M, P.R, P.N, P.Tmax, P.rfx_pairs,
+                          P.theta_names, P.col_id, P.seed)
+
+        # default: captured into errored / error_message, never throws
+        f = LT._logit2_rfx(Pbad, th0, nothing, Optim.Options())
+        @test f.errored
+        @test !f.converged
+        @test all(isnan, f.theta_hat)
+        @test !isempty(f.error_message)
+
+        # rethrow_errors = true: the original exception propagates
+        @test_throws Exception LT._logit2_rfx(Pbad, th0, nothing, Optim.Options();
+                                              rethrow_errors = true)
+
+        # the public entry points accept and forward the keyword
+        @test :rethrow_errors in Base.kwarg_decl(first(methods(logit2_rfx)))
+        @test :rethrow_errors in Base.kwarg_decl(first(methods(boot_logit2_rfx)))
+
+        # a normal fit is unaffected by the default
+        good = logit2_rfx(df, myxs, :pick1, :personid, th0;
+                          rfx = [:x1, :x3], ndraws = 50, seed = 7)
+        @test !good.errored
+    end
+
+    @testset "assembly error distinguishes failure modes" begin
+        df = _rfx_testdata(N = 40, T = 5, K = 3, seed = 21, beta = [0.6, -0.9, 0.4],
+                           sigma_true = [0.7, 0.4], rfx_idx = [1, 3])
+        myxs = [:x1, :x2, :x3]
+        th0  = theta0_rfx(myxs, [:x1, :x3])
+
+        # iterations = 0 -> every replicate runs but none converges
+        err = try
+            boot_logit2_rfx(df, myxs, :pick1, :personid, th0;
+                            rfx = [:x1, :x3], ndraws = 50, seed = 7,
+                            nboot = 4, parallel = false,
+                            optim_options = Optim.Options(iterations = 0))
+            nothing
+        catch e
+            sprint(showerror, e)
+        end
+        @test err !== nothing
+        @test occursin("0 errored", err)
+        @test occursin("did not converge", err)
+        @test occursin("optimiser problem", err)   # points at the right fix
     end
 
     # -----------------------------------------------------------------------

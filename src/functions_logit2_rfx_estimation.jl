@@ -463,7 +463,7 @@ end
 # ----------------------------------------------------------------------------
 
 """
-    _logit2_rfx(P, theta0, gw, optim_options) -> MLEFit
+    _logit2_rfx(P, theta0, gw, optim_options; rethrow_errors = false) -> MLEFit
 
 Inner estimation routine: takes a prepped `RfxPrep`, so the bootstrap can reuse
 prep and vary only the group weights `gw`.
@@ -472,14 +472,20 @@ Canonicalises `σ ≥ 0` at the source, so that every path — the main fit and 
 bootstrap replicate — returns a canonical sign. Without this, `cov(theta_boot_table)`
 would mix the `2^M` mirror modes and be meaningless.
 
-Never throws: on failure returns an `MLEFit` with `errored = true`, so a single
-bad bootstrap replicate cannot take the whole run down.
+By default this never throws: on failure it returns an `MLEFit` with
+`errored = true` and the message in `error_message`, so a single bad bootstrap
+replicate cannot take the whole run down.
+
+Pass `rethrow_errors = true` to disable that handler and let the original
+exception propagate with its stacktrace intact. This is the debugging switch to
+reach for when replicates fail and you need to see *why*.
 """
 function _logit2_rfx(
         P::RfxPrep,
         theta0::Vector{Float64},
         gw::Union{Nothing, Vector{Float64}},
-        optim_options::Optim.Options = Optim.Options())
+        optim_options::Optim.Options = Optim.Options();
+        rethrow_errors::Bool = false)
 
     npar = P.K + P.M
 
@@ -525,6 +531,7 @@ function _logit2_rfx(
         )
 
     catch e
+        rethrow_errors && rethrow(e)
         myfit = MLEFit(
             theta0      = theta0,
             theta_hat   = fill(NaN, npar),
@@ -569,6 +576,9 @@ too easy to transpose silently.
   function evaluation, so the objective is a deterministic function of θ.
 - `weights = nothing`: column name; must be constant within `col_id`.
 - `optim_options = Optim.Options()`.
+- `rethrow_errors = false`: by default a failed optimisation is captured into
+  `errored`/`error_message`. Set `true` to let the exception propagate instead,
+  which is what you want when debugging a fit that will not run.
 
 # Parameter ordering
 `θ = [β (K, in formula order); σ (M, in the order listed in rfx)]`, named
@@ -597,14 +607,15 @@ function logit2_rfx(
         ndraws::Int = 1000,
         seed::Int = 20260808,
         weights::Union{Nothing, Symbol, String} = nothing,
-        optim_options::Optim.Options = Optim.Options())
+        optim_options::Optim.Options = Optim.Options(),
+        rethrow_errors::Bool = false)
 
     P, gw = _prep_logit2_rfx(data_df, formula, choice, col_id, rfx,
                              ndraws, seed, weights)
 
     theta0 = _check_theta0_rfx(theta0, P)
 
-    myfit = _logit2_rfx(P, theta0, gw, optim_options)
+    myfit = _logit2_rfx(P, theta0, gw, optim_options; rethrow_errors = rethrow_errors)
 
     if !myfit.errored && P.M > 0 && myfit.extra.ess_p10 < 30
         @warn "10th-percentile effective number of draws is " *
