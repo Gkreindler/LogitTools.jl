@@ -355,6 +355,26 @@ end
             @test regtable_rfx(nb; ci_for_sd = false) !== nothing
         end
 
+        # sd_ detection is positional (extra.K), not name-based, so renaming
+        # coefficients cannot move the CI onto the wrong row
+        if has_api
+            st = LT._rfx_table_stats(fit, [2.5, 97.5])
+            @test st.is_sd == [false, false, false, true, true]
+
+            pretty = Dict("x1" => "Duration", "x2" => "Payment", "x3" => "Distance",
+                          "sd_x1" => "σ Duration", "sd_x3" => "σ Distance")
+            for kw in ((; labels = pretty),
+                       (; labels = Dict("x1" => "Duration")),        # partial
+                       (; transform_labels = Dict("x" => "var")),
+                       (; order = ["sd_x1", "sd_x3"]))               # sd rows first
+                s = sprint(show, regtable_rfx(fit; kw...))
+                # the sd_ rows still carry a CI pair, the beta rows a lone SE
+                @test occursin(string(round(st.ci_lo[4], digits = 3)), s)
+                @test occursin(string(round(st.ci_hi[4], digits = 3)), s)
+                @test count(==(','), s) >= 2      # one comma per CI, two sd rows
+            end
+        end
+
         # an M = 0 fit has no sd_ rows: falls back to the plain table
         f0 = logit2_rfx(df, myxs, :pick1, :personid, zeros(3); rfx = Symbol[], ndraws = 10)
         f0.vcov = boot_logit2_rfx(df, myxs, :pick1, :personid, zeros(3);

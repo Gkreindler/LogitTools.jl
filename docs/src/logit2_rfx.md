@@ -232,7 +232,43 @@ regtable_rfx(fit; ci_for_sd = false)     # conventional: standard errors through
 regtable_rfx(fit1, fit2)                 # several models, each with its own CIs
 ```
 
-Other keywords (`render = LatexTable()`, `labels`, …) are forwarded to `regtable`.
+Other keywords (`render = LatexTable()`, `labels`, `order`, …) are forwarded to
+`regtable`.
+
+### Pretty coefficient names
+
+`labels`, `transform_labels` and `order` are all safe: which rows are `σ` rows is
+determined **positionally** (from `fit.extra.K`), never by matching the `"sd_"`
+prefix in the name. So you can rename the standard deviations to anything and the
+confidence intervals stay attached to the right rows.
+
+```julia
+regtable_rfx(fit; labels = Dict(
+    "dur"    => "Duration",   "dist"    => "Distance",
+    "sd_dur" => "σ Duration", "sd_dist" => "σ Distance"))
+```
+
+```
+---------------------------
+Duration           0.601***
+                    (0.152)
+Distance           0.512***
+                    (0.096)
+σ Duration         0.852***
+             (0.619, 1.084)
+σ Distance            0.077
+             (0.003, 0.560)
+---------------------------
+```
+
+!!! warning "Do not map two coefficients to the same label"
+    RegressionTables matches rows by their rendered name, so if two coefficients
+    resolve to the same label it keeps the first and silently drops the second.
+    Mapping `dur` and `sd_dur` both to `"Duration"` loses the `σ` row entirely.
+    This is general `regtable` behaviour, not specific to `regtable_rfx` — plain
+    `regtable` drops the duplicate too — but it is easy to trigger here, since
+    a coefficient and its standard deviation naturally want similar names. Give
+    them distinct labels.
 
 !!! note
     `ci_for_sd = true` needs RegressionTables 0.7 or newer — the first version
