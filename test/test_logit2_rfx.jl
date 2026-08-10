@@ -356,6 +356,49 @@ end
             @test regtable_rfx(nb; ci_for_sd = false) !== nothing
         end
 
+        # small values render as <0.005 (the tight bound) rather than 0.00
+        @testset "small_as_lt" begin
+            asc, lat = AsciiTable(), LatexTable()
+
+            # exactly at the rounding boundary: 0.005 prints as 0.01, so it must
+            # NOT be flagged; anything below it prints as 0.00, so it must be
+            @test LT._rfx_fmt(asc, 0.005,  2, true) == "0.01"
+            @test LT._rfx_fmt(asc, 0.0049, 2, true) == "<0.005"
+            @test LT._rfx_fmt(asc, 0.003,  2, true) == "<0.005"
+            @test LT._rfx_fmt(asc, 0.12,   2, true) == "0.12"
+
+            # an exact zero stays an exact zero, and NaN is untouched
+            @test LT._rfx_fmt(asc, 0.0, 2, true) == "0.00"
+            @test LT._rfx_fmt(asc, NaN, 2, true) == "NaN"
+
+            # negatives of the same size
+            @test LT._rfx_fmt(asc, -0.003, 2, true) == ">-0.005"
+
+            # LaTeX needs math mode around the inequality
+            @test LT._rfx_fmt(lat, 0.003,  2, true) == "\$<\$0.005"
+            @test LT._rfx_fmt(lat, -0.003, 2, true) == "\$>\$-0.005"
+
+            # the threshold follows `digits`
+            @test LT._rfx_fmt(asc, 0.0004, 3, true) == "<0.0005"
+            @test LT._rfx_fmt(asc, 0.0006, 3, true) == "0.001"
+
+            # switch it off
+            @test LT._rfx_fmt(asc, 0.003, 2, false) == "0.00"
+
+            # end to end: on by default, suppressible
+            if has_api
+                s_on  = sprint(show, regtable_rfx(fit; digits = 2, digits_stats = 2))
+                s_off = sprint(show, regtable_rfx(fit; digits = 2, digits_stats = 2,
+                                                  small_as_lt = false))
+                st = LT._rfx_table_stats(fit, [2.5, 97.5])
+                if any(0 .< st.ci_lo[st.is_sd] .< 0.005)   # only if a bound is that small
+                    @test occursin("<0.005", s_on)
+                    @test !occursin("<0.005", s_off)
+                end
+                @test !occursin("<0.005", s_off)
+            end
+        end
+
         # stars on sd_ rows, and digits for the below-statistics
         if has_api
             st = LT._rfx_table_stats(fit, [2.5, 97.5])

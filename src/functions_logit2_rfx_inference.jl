@@ -193,6 +193,38 @@ the whole table.
 """
 struct RfxUnderStat <: RegressionTables.AbstractUnderStatistic
     val::Union{Float64, Tuple{Float64,Float64}}
+    small_as_lt::Bool
+end
+RfxUnderStat(val) = RfxUnderStat(val, true)
+
+"""
+    _rfx_fmt(render, u, digits, small_as_lt) -> String
+
+Render one number. With `small_as_lt`, a nonzero value too small to show at this
+many digits prints as `<0.01` (at `digits = 2`) rather than as `0.00`, so a
+confidence bound near the boundary is not mistaken for an exact zero. Negative
+values of the same size print as `>-0.01`.
+
+LaTeX needs `\$<\$`: a bare `<` in text mode renders as the wrong glyph.
+"""
+function _rfx_fmt(render, u, digits, small_as_lt::Bool)
+    s = Base.repr(render, u; digits, commas = false)
+
+    # Decide from the rendered string, not from a reimplemented rounding rule:
+    # that way the cutoff is exactly where this renderer prints all zeros, for
+    # any `digits`. (Comparing against 10.0^-digits / 2 is off by an ulp, so
+    # 0.005 -- which renders as 0.01 -- would be misflagged.)
+    if small_as_lt && u != 0 && isfinite(u) && all(c -> !isdigit(c) || c == '0', s)
+        islatex = render isa RegressionTables.AbstractLatex
+        sym = u > 0 ? (islatex ? "\$<\$" : "<") : (islatex ? "\$>\$-" : ">-")
+        # The tight bound. A value prints as 0.00 exactly when |u| < 0.005, so
+        # "<0.005" is what is actually known; "<0.01" would be true but loose.
+        # It needs one more decimal than the rest of the column.
+        edge = Base.repr(render, 0.5 * 10.0^(-digits); digits = digits + 1,
+                         commas = false)
+        return sym * edge
+    end
+    return s
 end
 
 # scalar renders like StdError, pair renders like ConfInt
@@ -200,9 +232,10 @@ function Base.repr(render::RegressionTables.AbstractRenderType, x::RfxUnderStat;
                    digits = RegressionTables.default_digits(render, 0.0), args...)
     v = x.val
     s = if v isa Tuple
-        Base.repr(render, v[1]; digits) * ", " * Base.repr(render, v[2]; digits)
+        _rfx_fmt(render, v[1], digits, x.small_as_lt) * ", " *
+        _rfx_fmt(render, v[2], digits, x.small_as_lt)
     else
-        Base.repr(render, v; digits, commas = false)
+        _rfx_fmt(render, v, digits, x.small_as_lt)
     end
     return RegressionTables.below_decoration(render, s)
 end
@@ -222,12 +255,15 @@ struct RfxBelowStatistic
                                 Tuple{Vector{Bool}, Vector{Float64},
                                       Vector{Float64}, Vector{Float64}}}}
     ci_for_sd::Bool
+    small_as_lt::Bool
 end
+RfxBelowStatistic(tbl, ci_for_sd) = RfxBelowStatistic(tbl, ci_for_sd, true)
 
 function (f::RfxBelowStatistic)(rr, k::Int; vargs...)
     d = f.tbl[rr]
-    return (f.ci_for_sd && d.is_sd[k]) ? RfxUnderStat((d.ci_lo[k], d.ci_hi[k])) :
-                                         RfxUnderStat(d.se[k])
+    return (f.ci_for_sd && d.is_sd[k]) ?
+        RfxUnderStat((d.ci_lo[k], d.ci_hi[k]), f.small_as_lt) :
+        RfxUnderStat(d.se[k], f.small_as_lt)
 end
 
 # A variance large enough that coef/se rounds to a t-statistic of zero, so
@@ -296,6 +332,16 @@ number of digits for the estimates and for the below-statistics respectively.
 Note that RegressionTables only applies `digits_stats` when `digits` is also
 given, so pass both.
 
+`small_as_lt = true` (the default) prints a below-statistic that is nonzero but
+too small to show at this many digits as `<0.005` (at `digits_stats = 2`) rather
+than as `0.00`, so a confidence bound sitting near the boundary is not mistaken
+for an exact zero. `0.00` is printed exactly when the value is below half of the
+last digit, so `<0.005` is the tight bound; it carries one more decimal than the
+rest of the column. It applies to every below-statistic — the `β` standard errors
+as well as the `σ` intervals. Pass `small_as_lt = false` for plain rounding.
+It has no effect on the `ci_for_sd = false, stars_for_sd = true` path, which
+delegates entirely to `regtable`.
+
 !!! note
     Per-row behaviour (`ci_for_sd = true` or `stars_for_sd = false`) needs
     RegressionTables 0.7 or newer, the first version whose `below_statistic`
@@ -314,7 +360,7 @@ regtable_rfx(fit; ci_for_sd = false, stars_for_sd = true)   # conventional table
 """
 function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
                       ci_levels = [2.5, 97.5], stars_for_sd::Bool = false,
-                      kwargs...)
+                      small_as_lt::Bool = true, kwargs...)
 
     isempty(fits) && error("regtable_rfx needs at least one MLEFit")
 
@@ -390,7 +436,8 @@ function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
 
     return RegressionTables.regtable(models...;
                                      render = AsciiTable(),
-                                     below_statistic = RfxBelowStatistic(stats, ci_for_sd),
+                                     below_statistic = RfxBelowStatistic(stats, ci_for_sd,
+                                                                         small_as_lt),
                                      kwargs...)
 end
 
