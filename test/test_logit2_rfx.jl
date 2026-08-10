@@ -415,10 +415,13 @@ end
             @test any(l -> occursin("*", l), filter(l -> startswith(strip(l), "x1"),
                                                     split(s_nostar, "\n")))
 
-            # digits_stats = 2 rounds both the SEs and the CI bounds
-            @test occursin("(" * string(round(st.se[1], digits = 2)), s_nostar)
-            @test occursin(string(round(st.ci_lo[4], digits = 2)) * ", " *
-                           string(round(st.ci_hi[4], digits = 2)), s_nostar)
+            # digits_stats = 2 rounds both the SEs and the CI bounds; SEs come in
+            # parentheses and intervals in square brackets
+            @test occursin("(" * string(round(st.se[1], digits = 2)) * ")", s_nostar)
+            @test occursin("[" * string(round(st.ci_lo[4], digits = 2)) * ", " *
+                           string(round(st.ci_hi[4], digits = 2)) * "]", s_nostar)
+            # an interval is never wrapped in parentheses
+            @test !occursin("(" * string(round(st.ci_lo[4], digits = 2)) * ", ", s_nostar)
             # ... and 3 digits (the default) gives a different rendering
             s3 = sprint(show, regtable_rfx(fit; digits = 3, digits_stats = 3))
             @test s3 != s_nostar

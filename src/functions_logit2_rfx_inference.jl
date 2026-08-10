@@ -227,17 +227,19 @@ function _rfx_fmt(render, u, digits, small_as_lt::Bool)
     return s
 end
 
-# scalar renders like StdError, pair renders like ConfInt
+# A scalar (a standard error) renders in parentheses like StdError; a pair (a
+# confidence interval) renders in SQUARE BRACKETS, so that a table mixing the two
+# — β rows with standard errors, σ rows with intervals — is readable without
+# having to consult the notes.
 function Base.repr(render::RegressionTables.AbstractRenderType, x::RfxUnderStat;
                    digits = RegressionTables.default_digits(render, 0.0), args...)
     v = x.val
-    s = if v isa Tuple
-        _rfx_fmt(render, v[1], digits, x.small_as_lt) * ", " *
-        _rfx_fmt(render, v[2], digits, x.small_as_lt)
-    else
-        _rfx_fmt(render, v, digits, x.small_as_lt)
+    if v isa Tuple
+        return "[" * _rfx_fmt(render, v[1], digits, x.small_as_lt) * ", " *
+                     _rfx_fmt(render, v[2], digits, x.small_as_lt) * "]"
     end
-    return RegressionTables.below_decoration(render, s)
+    return RegressionTables.below_decoration(render,
+                                             _rfx_fmt(render, v, digits, x.small_as_lt))
 end
 
 """
@@ -310,8 +312,8 @@ end
 1. The covariance type is reported through the public `vcov_method` helper
    rather than the hardcoded `Vcov.simple()`.
 2. With `ci_for_sd = true` (the default) the `sd_` rows print a **percentile
-   confidence interval** from the bootstrap replicates, while the `β` rows keep
-   their standard error.
+   confidence interval** from the bootstrap replicates, in square brackets, while
+   the `β` rows keep their standard error in parentheses.
 3. With `stars_for_sd = false` (the default) the `sd_` rows carry **no
    significance stars**.
 
