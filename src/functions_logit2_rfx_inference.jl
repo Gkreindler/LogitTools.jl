@@ -213,18 +213,26 @@ end
 Callable passed as `below_statistic`. RegressionTables invokes it as
 `(rr, k)` for coefficient `k` of model `rr`, which is what makes per-row
 dispatch possible. Keyed by model identity so a multi-model table stays correct.
+
+With `ci_for_sd = true` the `σ` rows get a percentile interval; otherwise every
+row gets its standard error.
 """
 struct RfxBelowStatistic
     tbl::IdDict{Any, NamedTuple{(:is_sd, :se, :ci_lo, :ci_hi),
                                 Tuple{Vector{Bool}, Vector{Float64},
                                       Vector{Float64}, Vector{Float64}}}}
+    ci_for_sd::Bool
 end
 
 function (f::RfxBelowStatistic)(rr, k::Int; vargs...)
     d = f.tbl[rr]
-    return d.is_sd[k] ? RfxUnderStat((d.ci_lo[k], d.ci_hi[k])) :
-                        RfxUnderStat(d.se[k])
+    return (f.ci_for_sd && d.is_sd[k]) ? RfxUnderStat((d.ci_lo[k], d.ci_hi[k])) :
+                                         RfxUnderStat(d.se[k])
 end
+
+# A variance large enough that coef/se rounds to a t-statistic of zero, so
+# RegressionTables' p-value comes out at ~1 and no significance stars are drawn.
+const _RFX_NO_STARS_VAR = 1e24
 
 """Per-parameter SEs and percentile CIs for one fit."""
 function _rfx_table_stats(fit::MLEFit, ci_levels)
@@ -257,9 +265,10 @@ function _rfx_table_stats(fit::MLEFit, ci_levels)
 end
 
 """
-    regtable_rfx(fits::MLEFit...; ci_for_sd = true, ci_levels = [2.5, 97.5], kwargs...)
+    regtable_rfx(fits::MLEFit...; ci_for_sd = true, ci_levels = [2.5, 97.5],
+                 stars_for_sd = false, kwargs...)
 
-`regtable` for random-coefficient fits, with two differences from the generic
+`regtable` for random-coefficient fits, with three differences from the generic
 `MLEFit` path:
 
 1. The covariance type is reported through the public `vcov_method` helper
@@ -267,32 +276,45 @@ end
 2. With `ci_for_sd = true` (the default) the `sd_` rows print a **percentile
    confidence interval** from the bootstrap replicates, while the `β` rows keep
    their standard error.
+3. With `stars_for_sd = false` (the default) the `sd_` rows carry **no
+   significance stars**.
 
-The second point is the statistically meaningful one. Because `σ`'s sign is not
-identified, estimates are canonicalised with `abs()`, which folds the sampling
-distribution and makes it skewed — so a symmetric `±1.96·se` interval is the
-wrong summary for those rows, increasingly so the closer `σ` sits to zero. The
-percentile interval is taken directly from the replicates and stays inside the
-parameter space.
+Points 2 and 3 are the statistically meaningful ones, and they have the same
+cause. Because `σ`'s sign is not identified, estimates are canonicalised with
+`abs()`, which folds the sampling distribution and makes it skewed — so a
+symmetric `±1.96·se` interval is the wrong summary for those rows, increasingly
+so the closer `σ` sits to zero. For the same reason a Wald test against zero is
+not calibrated there: `σ = 0` is on the boundary of the parameter space, where
+the LR statistic is a `½χ²₀ + ½χ²₁` mixture rather than `χ²₁`. Stars on those
+rows would invite exactly the reading they cannot support, so they are off by
+default; read the interval instead.
 
-Pass `ci_for_sd = false` for a conventional table with standard errors
-throughout. Any other keyword is forwarded to `regtable`.
+Pass `ci_for_sd = false` for standard errors throughout, and
+`stars_for_sd = true` to restore the conventional stars. Any other keyword is
+forwarded to `regtable` — including `digits` and `digits_stats`, which set the
+number of digits for the estimates and for the below-statistics respectively.
+Note that RegressionTables only applies `digits_stats` when `digits` is also
+given, so pass both.
 
 !!! note
-    `ci_for_sd = true` needs RegressionTables 0.7 or newer, which is the first
-    version whose `below_statistic` receives the coefficient index and so can
-    vary by row. On 0.6.x this throws with an explanatory message; use
-    `ci_for_sd = false` there.
+    Per-row behaviour (`ci_for_sd = true` or `stars_for_sd = false`) needs
+    RegressionTables 0.7 or newer, the first version whose `below_statistic`
+    receives the coefficient index. On 0.6.x this throws with an explanatory
+    message; use `ci_for_sd = false, stars_for_sd = true` there.
 
 # Example
 ```julia
 fit.vcov = boot_logit2_rfx(df, myxs, :pick1, :personid, theta0; rfx = myrfx)
-regtable_rfx(fit)                       # SE under β, 95% CI under sd_
-regtable_rfx(fit; ci_levels = [5, 95])  # 90% interval
+
+regtable_rfx(fit)                                  # SE under β, 95% CI under σ, no σ stars
+regtable_rfx(fit; digits = 2, digits_stats = 2)     # two digits everywhere
+regtable_rfx(fit; ci_levels = [5, 95])              # 90% interval
+regtable_rfx(fit; ci_for_sd = false, stars_for_sd = true)   # conventional table
 ```
 """
 function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
-                      ci_levels = [2.5, 97.5], kwargs...)
+                      ci_levels = [2.5, 97.5], stars_for_sd::Bool = false,
+                      kwargs...)
 
     isempty(fits) && error("regtable_rfx needs at least one MLEFit")
 
@@ -303,9 +325,24 @@ function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
 
     for fit in fits
         m = LogitRegModel(fit)                   # existing constructor, unmodified
+        d = _rfx_table_stats(fit, ci_levels)
+
+        # Suppressing stars on the σ rows: RegressionTables derives its p-values
+        # from coef / sqrt(diag(vcov)), so reporting a huge variance for those
+        # rows drives the t-statistic to ~0 and the p-value to ~1. The number
+        # itself is never displayed -- the σ rows' below-statistic comes from
+        # `stats`, not from this matrix -- so nothing else changes.
+        vc = m.vcov
+        if !stars_for_sd && any(d.is_sd)
+            vc = copy(vc)
+            for j in findall(d.is_sd)
+                vc[j, j] = _RFX_NO_STARS_VAR
+            end
+        end
+
         m_rfx = LogitRegModel(
             coef        = m.coef,
-            vcov        = m.vcov,
+            vcov        = vc,
             vcov_type   = vcov_method(fit),      # <- the public helper
             esample     = m.esample,
             fe          = m.fe,
@@ -325,33 +362,35 @@ function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
             converged   = m.converged,
         )
         push!(models, m_rfx)
-        stats[m_rfx] = _rfx_table_stats(fit, ci_levels)
+        stats[m_rfx] = d
     end
 
-    if !ci_for_sd
+    any_sd = any(any(stats[m].is_sd) for m in models)
+
+    # The plain regtable path is enough only when there is nothing to vary by
+    # row: no σ rows at all, or σ rows that want the ordinary standard error and
+    # the ordinary stars. It is also the only path that works on
+    # RegressionTables 0.6.
+    if !any_sd || (!ci_for_sd && stars_for_sd)
         return RegressionTables.regtable(models...; render = AsciiTable(), kwargs...)
     end
 
     _rfx_check_below_statistic_api()
 
-    any_sd = any(any(stats[m].is_sd) for m in models)
-    if !any_sd
-        # nothing to vary; keep the plain table rather than a pointless indirection
-        return RegressionTables.regtable(models...; render = AsciiTable(), kwargs...)
-    end
-
-    for m in models
-        d = stats[m]
-        if any(d.is_sd) && !all(isfinite, d.ci_lo[d.is_sd])
-            error("regtable_rfx(ci_for_sd = true) needs bootstrap replicates for the " *
-                  "sd_ rows, but this fit has no usable theta_boot_table. Run " *
-                  "boot_logit2_rfx first, or pass ci_for_sd = false.")
+    if ci_for_sd
+        for m in models
+            d = stats[m]
+            if any(d.is_sd) && !all(isfinite, d.ci_lo[d.is_sd])
+                error("regtable_rfx(ci_for_sd = true) needs bootstrap replicates for the " *
+                      "sd_ rows, but this fit has no usable theta_boot_table. Run " *
+                      "boot_logit2_rfx first, or pass ci_for_sd = false.")
+            end
         end
     end
 
     return RegressionTables.regtable(models...;
                                      render = AsciiTable(),
-                                     below_statistic = RfxBelowStatistic(stats),
+                                     below_statistic = RfxBelowStatistic(stats, ci_for_sd),
                                      kwargs...)
 end
 
@@ -360,11 +399,12 @@ function _rfx_check_below_statistic_api()
     ok = hasmethod(RegressionTables.StdError,
                    Tuple{RegressionTables.RegressionModel, Int})
     ok || error(
-        "regtable_rfx(ci_for_sd = true) requires RegressionTables 0.7 or newer: " *
-        "older versions call below_statistic with (se, coef, dof) and no coefficient " *
-        "index, so the statistic cannot vary by row. Installed version is " *
-        "$(pkgversion(RegressionTables)). Upgrade RegressionTables, or call " *
-        "regtable_rfx(fit; ci_for_sd = false).")
+        "regtable_rfx with ci_for_sd = true or stars_for_sd = false requires " *
+        "RegressionTables 0.7 or newer: older versions call below_statistic with " *
+        "(se, coef, dof) and no coefficient index, so the statistic cannot vary by " *
+        "row. Installed version is $(pkgversion(RegressionTables)). Upgrade " *
+        "RegressionTables, or call " *
+        "regtable_rfx(fit; ci_for_sd = false, stars_for_sd = true).")
     return nothing
 end
 

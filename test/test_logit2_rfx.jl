@@ -337,7 +337,8 @@ end
 
             # the under-statistic dispatches per row
             bs = LT.RfxBelowStatistic(IdDict{Any, NamedTuple{(:is_sd, :se, :ci_lo, :ci_hi),
-                    Tuple{Vector{Bool}, Vector{Float64}, Vector{Float64}, Vector{Float64}}}}())
+                    Tuple{Vector{Bool}, Vector{Float64}, Vector{Float64}, Vector{Float64}}}}(),
+                    true)   # ci_for_sd
             m = LogitTools.LogitRegModel(fit)
             bs.tbl[m] = st
             @test bs(m, 1).val isa Float64            # beta row -> scalar SE
@@ -353,6 +354,49 @@ end
                             rfx = [:x1, :x3], ndraws = 100, seed = 7)
             @test_throws ErrorException regtable_rfx(nb)
             @test regtable_rfx(nb; ci_for_sd = false) !== nothing
+        end
+
+        # stars on sd_ rows, and digits for the below-statistics
+        if has_api
+            st = LT._rfx_table_stats(fit, [2.5, 97.5])
+
+            # default: no stars on the sd_ rows; stars_for_sd = true restores them
+            s_nostar = sprint(show, regtable_rfx(fit; digits = 2, digits_stats = 2))
+            s_star   = sprint(show, regtable_rfx(fit; digits = 2, digits_stats = 2,
+                                                 stars_for_sd = true))
+            sd_lines_nostar = filter(l -> occursin("sd_", l), split(s_nostar, "\n"))
+            sd_lines_star   = filter(l -> occursin("sd_", l), split(s_star,   "\n"))
+            @test !any(l -> occursin("*", l), sd_lines_nostar)
+            @test any(l -> occursin("*", l), sd_lines_star)
+            # beta rows keep their stars either way
+            @test any(l -> occursin("*", l), filter(l -> startswith(strip(l), "x1"),
+                                                    split(s_nostar, "\n")))
+
+            # digits_stats = 2 rounds both the SEs and the CI bounds
+            @test occursin("(" * string(round(st.se[1], digits = 2)), s_nostar)
+            @test occursin(string(round(st.ci_lo[4], digits = 2)) * ", " *
+                           string(round(st.ci_hi[4], digits = 2)), s_nostar)
+            # ... and 3 digits (the default) gives a different rendering
+            s3 = sprint(show, regtable_rfx(fit; digits = 3, digits_stats = 3))
+            @test s3 != s_nostar
+
+            # suppressing stars must not disturb the displayed standard errors:
+            # with ci_for_sd = false the sd_ rows show their real SE, not the
+            # inflated variance used to kill the stars
+            s_se = sprint(show, regtable_rfx(fit; digits = 2, digits_stats = 2,
+                                             ci_for_sd = false))
+            @test occursin(string(round(st.se[4], digits = 2)), s_se)
+            @test !occursin("1.0e12", s_se)
+            @test !occursin("Inf", s_se)
+
+            # the caller's fit is never mutated
+            V44 = fit.vcov.V[4, 4]
+            regtable_rfx(fit)
+            @test fit.vcov.V[4, 4] == V44
+            @test V44 < 1.0
+
+            # fully conventional path still works (and is the only 0.6-safe one)
+            @test regtable_rfx(fit; ci_for_sd = false, stars_for_sd = true) !== nothing
         end
 
         # sd_ detection is positional (extra.K), not name-based, so renaming
