@@ -181,6 +181,337 @@ end
 # Reporting
 # ----------------------------------------------------------------------------
 
+# ---- lognormal: from the estimated log scale to reported level moments ------
+
+"""
+    _rfx_to_level(θ, K, rfx_pairs, rfx_cols) -> Vector{Float64}
+
+Map `θ = [μ; σ]` onto the vector that gets *reported*. Entries belonging to a
+`:normal` coefficient are copied through unchanged; for a lognormal rfx variable
+`m` sitting at formula position `k = rfx_cols[m]`,
+
+    out[k]     = ±exp(μ_m + σ_m²/2)                      = E[β_m]
+    out[K + m] =  exp(μ_m + σ_m²/2)·sqrt(exp(σ_m²) - 1)  = SD[β_m]
+
+so that a table row holds a level coefficient and a level standard deviation
+whatever the distribution, and a lognormal column is comparable with a normal one
+row by row.
+
+`expm1(σ²)` rather than `exp(σ²) - 1`: the latter loses most of its significant
+digits at the small σ a near-homogeneous coefficient produces, which is exactly
+where the number matters.
+"""
+function _rfx_to_level(θ, K::Int, rfx_pairs, rfx_cols)
+    out = collect(Float64, θ)
+    for (m, (_, d)) in enumerate(rfx_pairs)
+        _rfx_is_log(d) || continue
+        k  = rfx_cols[m]
+        μ  = θ[k]
+        σ  = θ[K + m]
+        m1 = exp(μ + σ^2 / 2)                    # E|β|
+        out[k]     = _rfx_sign(d) * m1
+        out[K + m] = m1 * sqrt(max(expm1(σ^2), 0.0))
+    end
+    return out
+end
+
+"""
+    _rfx_log_meta(fit) -> (K, rfx_pairs, rfx_cols) | nothing
+
+`nothing` unless `fit` actually has a lognormal random coefficient, in which case
+this is everything the level transform needs. Fits serialised before the
+lognormal families existed carry only `:normal` entries and so return `nothing`
+here — that is what keeps the reporting path for existing results untouched.
+"""
+function _rfx_log_meta(fit::MLEFit)
+    e = fit.extra
+    isnothing(e) && return nothing
+    (hasproperty(e, :rfx) && hasproperty(e, :K)) || return nothing
+    any(_rfx_is_log(last(p)) for p in e.rfx) || return nothing
+
+    cols = _rfx_cols_of(fit)
+    isnothing(cols) && error(
+        "this fit has lognormal random coefficients but the formula position of each " *
+        "rfx variable could not be recovered from extra.rfx_cols or theta_names, so " *
+        "the level moments cannot be located. Refit with the current LogitTools.")
+    return (e.K, e.rfx, cols)
+end
+
+"""
+    _rfx_cols_of(fit) -> Vector{Int} | nothing
+
+Formula index of each rfx variable. Prefers `extra.rfx_cols`; for fits serialised
+before that field existed, recovers it by matching the rfx variable names against
+the first `K` entries of `theta_names`. `nothing` when neither works — callers
+that only need this for labelling should degrade rather than fail.
+"""
+function _rfx_cols_of(fit::MLEFit)
+    e = fit.extra
+    isnothing(e) && return nothing
+    hasproperty(e, :rfx_cols) && return collect(Int, e.rfx_cols)
+    (hasproperty(e, :rfx) && hasproperty(e, :K)) || return nothing
+    isnothing(fit.theta_names) && return nothing
+
+    heads = fit.theta_names[1:e.K]
+    cols  = Int[]
+    for (v, _) in e.rfx
+        k = findfirst(==(string(v)), heads)
+        isnothing(k) && return nothing
+        push!(cols, k)
+    end
+    return cols
+end
+
+"""
+    rfx_level_moments(fit; ci_levels = [2.5, 97.5]) -> DataFrame
+
+Implied moments of the coefficient itself, for each **lognormal** random
+coefficient in `fit`: `mean = ±exp(μ + σ²/2)`, `median = ±exp(μ)` and
+`SD = exp(μ + σ²/2)·sqrt(exp(σ²) - 1)`, each with a bootstrap standard error and
+percentile interval computed by transforming the replicates one by one (not by a
+delta method — these transforms are strongly nonlinear in σ).
+
+!!! warning "Read the interval, not `boot_se`"
+    `boot_se` on a `mean` or `SD` row is reported for completeness and should
+    generally **not** be quoted. `exp(μ + σ²/2)` has a heavy right tail whenever `σ`
+    is not sharply identified, because the simulated likelihood has a flat ridge
+    along which a large `σ` is offset by a very negative `μ`; a few replicates from
+    that ridge dominate the second moment while leaving the percentiles alone. In
+    practice `boot_se` can be four orders of magnitude larger than the whole
+    percentile interval *without anything overflowing at all*. `ci_lo`/`ci_hi` are
+    the summary to use.
+
+`n_nonfinite` counts the replicates whose transform was not even representable
+(`exp` overflowed). It is the extreme end of the same phenomenon, not the only sign
+of it — a zero count does **not** certify `boot_se`. When the count is nonzero,
+`boot_se` is computed on the finite replicates so it is never `NaN`, but it may
+still be `Inf`, and the affected percentile bound is `Inf` too if the count exceeds
+the tail probability (1 replicate in 20 is 5%, above a 2.5% tail; 1 in 500 is not).
+
+Zero rows when `fit` has no lognormal random coefficient, so it is safe to call
+unconditionally. `boot_report` appends these rows automatically.
+"""
+function rfx_level_moments(fit::MLEFit; ci_levels = [2.5, 97.5])
+
+    out = DataFrame(variable = Symbol[], dist = Symbol[], quantity = String[],
+                    estimate = Float64[], boot_se = Float64[],
+                    ci_lo = Float64[], ci_hi = Float64[], n_nonfinite = Int[])
+
+    meta = _rfx_log_meta(fit)
+    isnothing(meta) && return out
+    K, rfx_pairs, rcols = meta
+
+    isnothing(fit.vcov) && error("fit has no vcov; run boot_logit2_rfx first")
+    keep = _boot_keep_rows(fit)
+    sum(keep) >= 2 || error("fewer than 2 usable bootstrap replicates")
+    kept = fit.vcov.theta_boot_table[keep, :]
+    B    = size(kept, 1)
+
+    keptL = _rfx_boot_to_level(kept, K, rfx_pairs, rcols)
+    lvl   = _rfx_to_level(fit.theta_hat, K, rfx_pairs, rcols)
+    lo, hi = ci_levels[1], ci_levels[2]
+
+    for (m, (v, d)) in enumerate(rfx_pairs)
+        _rfx_is_log(d) || continue
+        k = rcols[m]
+        s = _rfx_sign(d)
+
+        # median = ±exp(μ): not one of the two rows the table shows, so it is
+        # transformed here rather than in _rfx_to_level.
+        med      = s * exp(fit.theta_hat[k])
+        med_boot = [s * exp(kept[b, k]) for b in 1:B]
+
+        for (q, est, col) in (("mean",   lvl[k],     collect(view(keptL, :, k))),
+                              ("median", med,        med_boot),
+                              ("SD",     lvl[K + m], collect(view(keptL, :, K + m))))
+            # Percentiles need the full column; the standard error is computed on the
+            # finite part, because a replicate in the flat mu/sigma ridge maps to an
+            # unrepresentable level moment. n_nonfinite is how many, and a nonzero
+            # count means boot_se should not be quoted -- read ci_lo/ci_hi instead.
+            fin  = filter(isfinite, col)
+            nbad = length(col) - length(fin)
+            push!(out, (variable = v, dist = d, quantity = q, estimate = est,
+                        boot_se = length(fin) >= 2 ? std(fin) : NaN,
+                        ci_lo = percentile(col, lo), ci_hi = percentile(col, hi),
+                        n_nonfinite = nbad))
+        end
+    end
+
+    return out
+end
+
+"""
+    _rfx_log_param_stats(fit, ci_levels) -> Vector{NamedTuple}
+
+The *estimated* log-scale parameters of each lognormal random coefficient in
+`fit`: `mu` and `sd` (of `log|β|`) with their bootstrap standard errors, plus a
+percentile interval for `sd`. One entry per lognormal variable, empty otherwise.
+
+These come off the **untransformed** replicates, unlike `_rfx_table_stats`, which
+reports level moments.
+"""
+function _rfx_log_param_stats(fit::MLEFit, ci_levels)
+    out = NamedTuple[]
+    meta = _rfx_log_meta(fit)
+    isnothing(meta) && return out
+    K, rfx_pairs, rcols = meta
+
+    kept = nothing
+    if !isnothing(fit.vcov) && !isnothing(fit.vcov.theta_boot_table)
+        keep = _boot_keep_rows(fit)
+        sum(keep) >= 2 && (kept = fit.vcov.theta_boot_table[keep, :])
+    end
+    lo, hi = ci_levels[1], ci_levels[2]
+
+    for (m, (v, d)) in enumerate(rfx_pairs)
+        _rfx_is_log(d) || continue
+        k, j = rcols[m], K + m
+        push!(out, (
+            var   = v,
+            dist  = d,
+            mu    = Float64(fit.theta_hat[k]),
+            mu_se = isnothing(kept) ? NaN : std(view(kept, :, k)),
+            mu_lo = isnothing(kept) ? NaN : percentile(view(kept, :, k), lo),
+            mu_hi = isnothing(kept) ? NaN : percentile(view(kept, :, k), hi),
+            sd    = Float64(fit.theta_hat[j]),
+            sd_se = isnothing(kept) ? NaN : std(view(kept, :, j)),
+            sd_lo = isnothing(kept) ? NaN : percentile(view(kept, :, j), lo),
+            sd_hi = isnothing(kept) ? NaN : percentile(view(kept, :, j), hi)))
+    end
+    return out
+end
+
+"""Format one number at a fixed number of decimals, so 0.30 does not print as 0.3."""
+_rfx_num(x, d::Int) = Printf.format(Printf.Format("%.$(d)f"), x)
+
+"""
+    _rfx_log_param_rows(fits, labels, ci_levels, digits, digits_stats, ci_for_sd)
+
+`extralines` rows carrying the estimated log-scale parameters: one row for `mu`
+and one for `sigma` of `log|β|`, per lognormal variable, per column.
+
+The main table prints level moments, which is what makes a lognormal column
+comparable with a normal one — but those are not the parameters that were
+estimated, and a reader cannot invert `E[β]` and `SD[β]` back to `mu` and `sigma`
+without being told the transform. These rows put the estimates themselves in the
+table, which is the other half of the usual convention (Revelt & Train 1998;
+Train's textbook tables report `mu` and `sigma` and the implied moments together).
+
+With `ci_for_sd = true` (the default) both rows carry a **percentile interval** in
+square brackets; with `ci_for_sd = false` both carry a bootstrap **standard error**
+in parentheses.
+
+For `sigma` the interval is right for the reason the level SD rows give: its sign is
+unidentified, the estimate is canonicalised with `abs()`, and `sigma = 0` sits on the
+boundary of the parameter space, so a symmetric interval is not calibrated.
+
+For `mu` the case is less automatic — its sign *is* identified and it is not near a
+boundary, so a standard error would be the textbook choice. The interval is the
+default anyway because `mu` and `sigma` trade off along a flat ridge of the simulated
+likelihood: a replicate that lands there has a large `sigma` offset by a very negative
+`mu`, and a handful of such draws dominates `mu`'s bootstrap standard error while
+leaving its percentiles alone. When `sigma` is well identified the two agree, and
+`ci_for_sd = false` gives the conventional standard errors throughout.
+
+Estimate and below-statistic share one line here rather than taking two, because
+these are auxiliary parameters in a panel below the table and a two-line block per
+parameter would double an already long footer.
+"""
+function _rfx_log_param_rows(fits, labels, ci_levels, digits::Int, digits_stats::Int,
+                             ci_for_sd::Bool)
+
+    per = [_rfx_log_param_stats(f, ci_levels) for f in fits]
+    all(isempty, per) && return Vector{Vector{String}}()
+
+    # Variable order: first appearance across columns, so a table whose lognormal
+    # columns carry different rfx sets still reads top to bottom.
+    vars = Symbol[]
+    for p in per, r in p
+        r.var in vars || push!(vars, r.var)
+    end
+
+    lab(v) = (s = string(v); isnothing(labels) ? s : string(get(labels, s, s)))
+
+    n    = length(fits)
+    rows = Vector{Vector{String}}()
+    push!(rows, vcat(["Log-scale parameters of \$\\log\\beta\$"], fill("", n)))
+
+    for v in vars
+        murow = vcat(["\\quad \$\\mu\$ " * lab(v)], fill("", n))
+        sdrow = vcat(["\\quad \$\\sigma_{\\log}\$ " * lab(v)], fill("", n))
+
+        for (c, p) in enumerate(per)
+            i = findfirst(r -> r.var === v, p)
+            isnothing(i) && continue          # this column is normal, or lacks v
+            r = p[i]
+
+            below(est, se, lo, hi) =
+                if ci_for_sd && isfinite(lo) && isfinite(hi)
+                    " [" * _rfx_num(lo, digits_stats) * ", " *
+                           _rfx_num(hi, digits_stats) * "]"
+                elseif isfinite(se)
+                    " (" * _rfx_num(se, digits_stats) * ")"
+                else
+                    ""
+                end
+
+            murow[c + 1] = _rfx_num(r.mu, digits) *
+                           below(r.mu, r.mu_se, r.mu_lo, r.mu_hi)
+            sdrow[c + 1] = _rfx_num(r.sd, digits) *
+                           below(r.sd, r.sd_se, r.sd_lo, r.sd_hi)
+        end
+
+        push!(rows, murow)
+        push!(rows, sdrow)
+    end
+
+    return rows
+end
+
+"""Apply `_rfx_to_level` row by row to a `nboot × npar` replicate matrix."""
+function _rfx_boot_to_level(tbl::AbstractMatrix, K::Int, rfx_pairs, rfx_cols)
+    out = similar(tbl, Float64)
+    for b in axes(tbl, 1)
+        out[b, :] .= _rfx_to_level(view(tbl, b, :), K, rfx_pairs, rfx_cols)
+    end
+    return out
+end
+
+"""
+    _rfx_boot_se(kept) -> (se, n_nonfinite)
+
+Per-column bootstrap standard error, computed over the **finite** replicates only,
+with the count of what had to be excluded.
+
+Why this is needed rather than a plain `std`. A lognormal level moment is
+`exp(mu + sigma^2/2)`. The simulated likelihood has a flat ridge along which a large
+`sigma` is offset by a very negative `mu` — a legitimately *converged* replicate can
+sit at `sigma = 79`, `mu = -149` — and the level moment there is astronomically
+large or `Inf`. `std` over a column containing one `Inf` is `NaN`, which would reach
+a table as a printed `NaN`, and even without an `Inf` a handful of `1e14` draws puts
+the standard error at `1e12`.
+
+Filtering to finite values keeps the number computable; the count is what makes the
+problem visible instead of silent. Note that this does **not** rescue the standard
+error as a *summary*: when the count is nonzero, the honest reading is that the
+level moment's bootstrap variance is not usefully finite, and the percentile
+interval — which a few tail draws cannot move — is the statistic to report. That is
+why `ci_for_sd = true` routes those rows to intervals.
+"""
+function _rfx_boot_se(kept::AbstractMatrix)
+    npar = size(kept, 2)
+    se   = Vector{Float64}(undef, npar)
+    nbad = zeros(Int, npar)
+    for j in 1:npar
+        c   = view(kept, :, j)
+        fin = [x for x in c if isfinite(x)]
+        nbad[j] = length(c) - length(fin)
+        se[j]   = length(fin) >= 2 ? std(fin) : NaN
+    end
+    return se, nbad
+end
+
+
 # ---- mixed below-statistic: SE for β rows, percentile CI for σ rows --------
 
 """
@@ -253,9 +584,7 @@ With `ci_for_sd = true` the `σ` rows get a percentile interval; otherwise every
 row gets its standard error.
 """
 struct RfxBelowStatistic
-    tbl::IdDict{Any, NamedTuple{(:is_sd, :se, :ci_lo, :ci_hi),
-                                Tuple{Vector{Bool}, Vector{Float64},
-                                      Vector{Float64}, Vector{Float64}}}}
+    tbl::IdDict{Any, NamedTuple}
     ci_for_sd::Bool
     small_as_lt::Bool
 end
@@ -263,7 +592,14 @@ RfxBelowStatistic(tbl, ci_for_sd) = RfxBelowStatistic(tbl, ci_for_sd, true)
 
 function (f::RfxBelowStatistic)(rr, k::Int; vargs...)
     d = f.tbl[rr]
-    return (f.ci_for_sd && d.is_sd[k]) ?
+    # Lognormal level rows get the interval for the same reason the sigma rows do,
+    # and then some: E[b] and SD[b] are exp() transforms, so a replicate that lands
+    # in the flat mu/sigma ridge (large sigma, compensating mu) maps to an enormous
+    # level moment and the bootstrap variance is not usefully finite. Percentiles
+    # are unaffected by a handful of such draws; a standard error is destroyed by
+    # them. See _rfx_boot_se.
+    use_ci = f.ci_for_sd && (d.is_sd[k] || d.is_log_row[k])
+    return use_ci ?
         RfxUnderStat((d.ci_lo[k], d.ci_hi[k]), f.small_as_lt) :
         RfxUnderStat(d.se[k], f.small_as_lt)
 end
@@ -272,18 +608,43 @@ end
 # RegressionTables' p-value comes out at ~1 and no significance stars are drawn.
 const _RFX_NO_STARS_VAR = 1e24
 
-"""Per-parameter SEs and percentile CIs for one fit."""
+"""
+    _rfx_table_stats(fit, ci_levels) -> (; is_sd, is_log_row, coef, se, ci_lo, ci_hi)
+
+Everything one fit contributes to a table row: the displayed point estimate, its
+standard error, and its percentile interval.
+
+`coef` is `theta_hat` unless the fit has a lognormal random coefficient, in which
+case the two rows belonging to it hold `E[β]` and `SD[β]` instead of `μ` and
+`σ_log` — see [`_rfx_to_level`](@ref). The bootstrap replicates are then put
+through the same transform *before* the standard error and the interval are taken,
+so all three numbers in a row describe the same quantity. `is_log_row` marks the
+transformed rows, because a Wald test against zero is vacuous there: `E[β]` and
+`SD[β]` are positive by construction under a lognormal.
+"""
 function _rfx_table_stats(fit::MLEFit, ci_levels)
     npar = length(fit.theta_hat)
     e = fit.extra
     K = isnothing(e) ? npar : e.K
     is_sd = [j > K for j in 1:npar]
 
-    V  = vcov(fit)
-    se = [sqrt(max(V[j, j], 0.0)) for j in 1:npar]
+    meta = _rfx_log_meta(fit)          # nothing unless a lognormal rfx is present
 
-    ci_lo = fill(NaN, npar)
-    ci_hi = fill(NaN, npar)
+    is_log_row = falses(npar)
+    if !isnothing(meta)
+        Kl, rfx_pairs, rcols = meta
+        for (m, (_, d)) in enumerate(rfx_pairs)
+            _rfx_is_log(d) || continue
+            is_log_row[rcols[m]] = true
+            is_log_row[Kl + m]   = true
+        end
+    end
+
+    coef = isnothing(meta) ? collect(Float64, fit.theta_hat) :
+                             _rfx_to_level(fit.theta_hat, meta...)
+
+    # Kept replicates, on the reported scale.
+    kept = nothing
     if !isnothing(fit.vcov) && !isnothing(fit.vcov.theta_boot_table)
         nbootpar = size(fit.vcov.theta_boot_table, 2)
         nbootpar == npar || error(
@@ -292,23 +653,79 @@ function _rfx_table_stats(fit::MLEFit, ci_levels)
         keep = _boot_keep_rows(fit)
         if sum(keep) >= 2
             kept = fit.vcov.theta_boot_table[keep, :]
-            for j in 1:npar
-                ci_lo[j] = percentile(view(kept, :, j), ci_levels[1])
-                ci_hi[j] = percentile(view(kept, :, j), ci_levels[2])
-            end
+            isnothing(meta) || (kept = _rfx_boot_to_level(kept, meta...))
         end
     end
 
-    return (; is_sd, se, ci_lo, ci_hi)
+    # With no lognormal row this is diag(vcov(fit)) exactly as before. With one,
+    # vcov(fit) describes μ and σ_log and so says nothing about the SE of the
+    # transformed quantity; the replicates do. Same convention either way, since
+    # V is itself cov(theta_boot_table[keep, :]).
+    se = if isnothing(meta)
+        V = vcov(fit)
+        [sqrt(max(V[j, j], 0.0)) for j in 1:npar]
+    else
+        isnothing(kept) && error(
+            "a fit with lognormal random coefficients needs bootstrap replicates to be " *
+            "tabulated: the standard error of the implied level moment cannot be read " *
+            "off vcov(fit), which describes μ and σ_log. Run boot_logit2_rfx first.")
+        s, nbad = _rfx_boot_se(kept)
+        if any(nbad[is_log_row] .> 0)
+            j = findfirst(j -> is_log_row[j] && nbad[j] > 0, 1:npar)
+            @warn "the implied level moment of a lognormal coefficient overflowed in " *
+                  "$(nbad[j]) of $(size(kept, 1)) bootstrap replicates (first affected " *
+                  "row: $(isnothing(fit.theta_names) ? j : fit.theta_names[j])). Those " *
+                  "replicates sit in the flat μ/σ ridge, where exp(μ + σ²/2) is not " *
+                  "representable. The percentile interval is unaffected and is what " *
+                  "ci_for_sd = true reports; the standard error for that row is not " *
+                  "usefully finite and should not be quoted."
+        end
+        s
+    end
+
+    ci_lo = fill(NaN, npar)
+    ci_hi = fill(NaN, npar)
+    if !isnothing(kept)
+        for j in 1:npar
+            ci_lo[j] = percentile(view(kept, :, j), ci_levels[1])
+            ci_hi[j] = percentile(view(kept, :, j), ci_levels[2])
+        end
+    end
+
+    return (; is_sd, is_log_row, coef, se, ci_lo, ci_hi)
 end
 
 """
     regtable_rfx(fits::MLEFit...; ci_for_sd = true, ci_levels = [2.5, 97.5],
-                 stars_for_sd = false, kwargs...)
+                 stars_for_sd = false, stars_for_lognormal = false, kwargs...)
 
-`regtable` for random-coefficient fits, with three differences from the generic
+`regtable` for random-coefficient fits, with four differences from the generic
 `MLEFit` path:
 
+0. A **lognormal** random coefficient is reported on the level scale: its two
+   rows hold `E[β] = ±exp(μ + σ²/2)` and `SD[β]`, not the `μ` and `σ_log` that
+   were estimated, with the bootstrap replicates transformed before the standard
+   error and the interval are taken. This is what makes a lognormal column
+   comparable with a normal one row by row, since the log-scale parameters are on
+   a different scale from every other coefficient in the table. The estimated
+   `μ` and `σ_log` are **not** dropped: with `log_params = true` (the default) they
+   are appended as `extralines`, one line each per lognormal variable — see
+   [`_rfx_log_param_rows`](@ref) for the below-statistic they carry. The full set of
+   level moments, including the median, is in [`rfx_level_moments`](@ref), and
+   `boot_report` carries both scales.
+
+   The two level rows carry a **percentile interval**, not a standard error, even
+   though `E[β]` is a mean. `E[β]` and `SD[β]` are `exp()` transforms of `(μ, σ)`, and
+   the simulated likelihood has a flat ridge along which a large `σ` is offset by a
+   very negative `μ`; a replicate converging there maps to a level moment of `1e14`
+   or to `Inf`, which destroys the bootstrap standard error while leaving the
+   percentiles untouched. `ci_for_sd = false` gives standard errors throughout, and
+   warns when any replicate overflowed.
+
+   Such a fit needs bootstrap replicates and RegressionTables 0.7+, and by default
+   carries no significance stars on either of its two main rows — `E[β]` and `SD[β]`
+   are positive by construction, so a Wald test against zero there is vacuous. Pass
+   `stars_for_lognormal = true` to restore them.
 1. The covariance type is reported through the public `vcov_method` helper
    rather than the hardcoded `Vcov.simple()`.
 2. With `ci_for_sd = true` (the default) the `sd_` rows print a **percentile
@@ -327,9 +744,10 @@ the LR statistic is a `½χ²₀ + ½χ²₁` mixture rather than `χ²₁`. Sta
 rows would invite exactly the reading they cannot support, so they are off by
 default; read the interval instead.
 
-Pass `ci_for_sd = false` for standard errors throughout, and
-`stars_for_sd = true` to restore the conventional stars. Any other keyword is
-forwarded to `regtable` — including `digits` and `digits_stats`, which set the
+Pass `ci_for_sd = false` for standard errors throughout,
+`stars_for_sd = true` to restore the conventional stars on the `sd_` rows, and
+`stars_for_lognormal = true` for those on a lognormal coefficient's two rows. Any
+other keyword is forwarded to `regtable` — including `digits` and `digits_stats`, which set the
 number of digits for the estimates and for the below-statistics respectively.
 Note that RegressionTables only applies `digits_stats` when `digits` is also
 given, so pass both.
@@ -362,34 +780,55 @@ regtable_rfx(fit; ci_for_sd = false, stars_for_sd = true)   # conventional table
 """
 function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
                       ci_levels = [2.5, 97.5], stars_for_sd::Bool = false,
+                      stars_for_lognormal::Bool = false,
+                      log_params::Bool = true,
                       small_as_lt::Bool = true, kwargs...)
 
     isempty(fits) && error("regtable_rfx needs at least one MLEFit")
 
-    models = LogitRegModel[]
-    stats  = IdDict{Any, NamedTuple{(:is_sd, :se, :ci_lo, :ci_hi),
-                                    Tuple{Vector{Bool}, Vector{Float64},
-                                          Vector{Float64}, Vector{Float64}}}}()
+    # Stats first, then the rendering path, then the models. The order matters:
+    # star suppression writes a huge variance onto the vcov diagonal, and that is
+    # invisible only on the path where every below-statistic comes from `stats`
+    # instead of from that matrix. So the decision has to be made before the
+    # models are built.
+    ds = [_rfx_table_stats(fit, ci_levels) for fit in fits]
 
-    for fit in fits
+    any_sd  = any(any(d.is_sd)      for d in ds)
+    any_log = any(any(d.is_log_row) for d in ds)
+
+    # A lognormal fit always takes the per-row path, even with
+    # stars_for_lognormal = true: its displayed coefficients are level moments,
+    # whose standard errors live in `stats` and not in vcov(fit).
+    plain = (!any_sd || (!ci_for_sd && stars_for_sd)) && !any_log
+
+    models = LogitRegModel[]
+    stats  = IdDict{Any, NamedTuple}()
+
+    for (fit, d) in zip(fits, ds)
         m = LogitRegModel(fit)                   # existing constructor, unmodified
-        d = _rfx_table_stats(fit, ci_levels)
 
         # Suppressing stars on the σ rows: RegressionTables derives its p-values
         # from coef / sqrt(diag(vcov)), so reporting a huge variance for those
         # rows drives the t-statistic to ~0 and the p-value to ~1. The number
-        # itself is never displayed -- the σ rows' below-statistic comes from
-        # `stats`, not from this matrix -- so nothing else changes.
+        # itself is never displayed -- those rows' below-statistic comes from
+        # `stats`, not from this matrix -- so nothing else changes. Lognormal rows
+        # get the same treatment by default: E[β] and SD[β] are positive by
+        # construction, so a Wald test against zero there means nothing.
         vc = m.vcov
-        if !stars_for_sd && any(d.is_sd)
-            vc = copy(vc)
-            for j in findall(d.is_sd)
-                vc[j, j] = _RFX_NO_STARS_VAR
+        if !plain
+            nostar = falses(length(d.is_sd))
+            stars_for_sd        || (nostar .|= d.is_sd)
+            stars_for_lognormal || (nostar .|= d.is_log_row)
+            if any(nostar)
+                vc = copy(vc)
+                for j in findall(nostar)
+                    vc[j, j] = _RFX_NO_STARS_VAR
+                end
             end
         end
 
         m_rfx = LogitRegModel(
-            coef        = m.coef,
+            coef        = d.coef,
             vcov        = vc,
             vcov_type   = vcov_method(fit),      # <- the public helper
             esample     = m.esample,
@@ -413,13 +852,11 @@ function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
         stats[m_rfx] = d
     end
 
-    any_sd = any(any(stats[m].is_sd) for m in models)
-
     # The plain regtable path is enough only when there is nothing to vary by
     # row: no σ rows at all, or σ rows that want the ordinary standard error and
-    # the ordinary stars. It is also the only path that works on
-    # RegressionTables 0.6.
-    if !any_sd || (!ci_for_sd && stars_for_sd)
+    # the ordinary stars, and no lognormal coefficient. It is also the only path
+    # that works on RegressionTables 0.6.
+    if plain
         return RegressionTables.regtable(models...; render = AsciiTable(), kwargs...)
     end
 
@@ -436,11 +873,28 @@ function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
         end
     end
 
+    kw = Dict{Symbol,Any}(kwargs)
+
+    # The estimated log-scale parameters go into `extralines`, ahead of whatever the
+    # caller passed: they are estimates, and the caller's lines are usually
+    # specification descriptors ("Random coefficients", "Simulation draws"), which
+    # read better underneath. `digits`/`digits_stats` follow the table.
+    if log_params && any_log
+        dg  = get(kw, :digits, 3)
+        dgs = get(kw, :digits_stats, dg)
+        rows = _rfx_log_param_rows(fits, get(kw, :labels, nothing), ci_levels,
+                                   dg, dgs, ci_for_sd)
+        if !isempty(rows)
+            user = get(kw, :extralines, nothing)
+            kw[:extralines] = isnothing(user) ? rows : vcat(rows, collect(user))
+        end
+    end
+
     return RegressionTables.regtable(models...;
                                      render = AsciiTable(),
                                      below_statistic = RfxBelowStatistic(stats, ci_for_sd,
                                                                          small_as_lt),
-                                     kwargs...)
+                                     kw...)
 end
 
 """Feature-detect the RegressionTables API that per-row below statistics need."""
@@ -493,6 +947,14 @@ end
     boot_report(fit; ci_levels = [2.5, 97.5], sd_tol = 1e-3) -> DataFrame
 
 One row per parameter, with a header block summarising the run.
+
+Two columns describe *what* each row is: `dist` (`:none` for a plain coefficient,
+otherwise the random coefficient's distribution) and `scale`. For a lognormal
+random coefficient `scale == "log"`, meaning `estimate` is `μ` or `σ` of `log|β|`
+rather than a level — the estimated parameters, which is what
+[`rfx_level_moments`](@ref) does not give you. The implied level moments
+(`E[.]`, `median[.]`, `SD[.]`) are appended as extra rows with `scale == "level"`,
+so the CSV carries both scales and neither has to be reconstructed by hand.
 
 For the `σ` rows, **lead with the percentile CI rather than the standard error**.
 The `abs()` canonicalisation folds the sampling distribution, so it is skewed —
@@ -551,13 +1013,62 @@ function boot_report(fit::MLEFit; ci_levels = [2.5, 97.5], sd_tol = 1e-3)
     ci_hi   = [percentile(view(kept, :, j), hi) for j in 1:npar]
     share_nz = [is_sd[j] ? mean(view(kept, :, j) .< sd_tol) : NaN for j in 1:npar]
 
-    return DataFrame(
+    # ---- which distribution each row belongs to, and on which scale ---------
+    # For a lognormal coefficient, `estimate` is μ or σ of log|β| sitting under a
+    # row name ("any_fam", "sd_any_fam") that reads like a level. `scale` is what
+    # stops that being misread; the level moments are appended below.
+    rfx_pairs = (!isnothing(e) && hasproperty(e, :rfx)) ? collect(e.rfx) :
+                                                          Pair{Symbol,Symbol}[]
+    rcols = _rfx_cols_of(fit)
+    dist  = fill(:none, npar)
+    scale = fill("level", npar)
+    for (m, (v, d)) in enumerate(rfx_pairs)
+        dist[K + m] = d
+        _rfx_is_log(d) && (scale[K + m] = "log")
+        if !isnothing(rcols)
+            dist[rcols[m]] = d
+            _rfx_is_log(d) && (scale[rcols[m]] = "log")
+        end
+    end
+
+    out = DataFrame(
         param           = names_,
+        dist            = dist,
+        scale           = scale,
         is_sd           = is_sd,
-        estimate        = fit.theta_hat,
+        estimate        = collect(Float64, fit.theta_hat),
         boot_se         = boot_se,
         ci_lo           = ci_lo,
         ci_hi           = ci_hi,
         share_near_zero = share_nz,
+        n_nonfinite     = zeros(Int, npar),   # only the level-moment rows can overflow
     )
+
+    # ---- implied level moments for the lognormal coefficients ---------------
+    lm = rfx_level_moments(fit; ci_levels = ci_levels)
+    if nrow(lm) > 0
+        println("  scales     : rows with scale = \"log\" hold μ and σ of log|β|;")
+        println("               the E[.] / median[.] / SD[.] rows are level moments.")
+        println()
+        for r in eachrow(lm)
+            push!(out, (param = "$(r.quantity)[$(r.variable)]",
+                        dist  = r.dist,
+                        scale = "level",
+                        is_sd = r.quantity == "SD",
+                        estimate = r.estimate,
+                        boot_se  = r.boot_se,
+                        ci_lo    = r.ci_lo,
+                        ci_hi    = r.ci_hi,
+                        share_near_zero = NaN,
+                        n_nonfinite = r.n_nonfinite))
+        end
+        if any(lm.n_nonfinite .> 0)
+            println("  WARNING    : a level moment overflowed in up to " *
+                    "$(maximum(lm.n_nonfinite)) replicate(s); boot_se is not usable")
+            println("               for those rows -- read ci_lo/ci_hi instead.")
+            println()
+        end
+    end
+
+    return out
 end

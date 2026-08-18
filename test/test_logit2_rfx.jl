@@ -185,9 +185,9 @@ end
         # duplicate rfx
         @test_throws ErrorException logit2_rfx(df, myxs, :pick1, :personid,
                                                [0.0, 0.0, 0.0, 0.5, 0.5]; rfx = [:x1, :x1])
-        # unsupported distribution
+        # unsupported distribution (:normal, :lognormal, :neg_lognormal are the set)
         @test_throws ErrorException logit2_rfx(df, myxs, :pick1, :personid, ok4;
-                                               rfx = [:x1 => :lognormal])
+                                               rfx = [:x1 => :uniform])
         # wrong theta0 length
         @test_throws ErrorException logit2_rfx(df, myxs, :pick1, :personid, zeros(2); rfx = [:x1])
         # sigma0 == 0 (saddle)
@@ -485,11 +485,11 @@ end
         th0  = theta0_rfx(myxs, [:x1, :x3])
 
         P, _ = LT._prep_logit2_rfx(df, myxs, :pick1, :personid, [:x1, :x3], 50, 7, nothing)
-        # poison the draws so the kernel throws
-        Pbad = LT.RfxPrep(P.xmatrix, P.zmatrix, P.yvec, P.q, P.ranges,
-                          fill(NaN, size(P.eta)), P.logw, P.group_ids,
-                          P.K, P.M, P.R, P.N, P.Tmax, P.rfx_pairs,
-                          P.theta_names, P.col_id, P.seed)
+        # poison the draws so the kernel throws. Copy field by field rather than
+        # listing the constructor positionally, so adding a field to RfxPrep does
+        # not break this test.
+        Pbad = LT.RfxPrep((f === :eta ? fill(NaN, size(P.eta)) : getfield(P, f)
+                           for f in fieldnames(LT.RfxPrep))...)
 
         # default: captured into errored / error_message, never throws
         f = LT._logit2_rfx(Pbad, th0, nothing, Optim.Options())
@@ -617,5 +617,405 @@ end
         @test maximum(abs.(fit.theta_hat[4:5] .- sigma)) < 0.1
         @test maximum(abs.(fit.theta_hat[1:3] .- beta)) < 0.15
         @test fit.extra.ess_p10 > 30
+    end
+
+    # -----------------------------------------------------------------------
+    # Lognormal / neg-lognormal random coefficients
+    # -----------------------------------------------------------------------
+    @testset "lognormal" begin
+
+        """Prep + buffers + group weights for an explicit rfx spec."""
+        function _ln_setup(rfx; K = 4, R = 64, N = 60, T = 5, seed = 42)
+            df = _rfx_testdata(N = N, T = T, K = K, seed = seed)
+            formula = [Symbol("x", k) for k in 1:K]
+            P, _ = LT._prep_logit2_rfx(df, formula, :pick1, :personid, rfx, R,
+                                       20260808, nothing)
+            gw = 0.3 .+ 1.5 .* rand(MersenneTwister(7), P.N)
+            return P, LT.RfxBuffers(P), gw
+        end
+
+        # -------------------------------------------------------------------
+        @testset "the all-normal path is structurally untouched" begin
+            P, _, _ = _ln_setup([:x1, :x2])
+            @test !P.any_log
+            @test P.xlin === P.xmatrix           # same memory, not a zeroed copy
+            @test P.rfx_islog == [false, false]
+            @test P.rfx_cols  == [1, 2]
+            @test P.rfx_sgn   == [1.0, 1.0]
+        end
+
+        @testset "xlin zeroes exactly the lognormal columns" begin
+            P, _, _ = _ln_setup([:x1 => :lognormal, :x3 => :normal])
+            @test P.any_log
+            @test P.rfx_islog == [true, false]
+            @test P.rfx_cols  == [1, 3]
+            @test all(P.xlin[:, 1] .== 0)                # lognormal: out of the linear part
+            @test P.xlin[:, 2] == P.xmatrix[:, 2]
+            @test P.xlin[:, 3] == P.xmatrix[:, 3]        # normal: still in the linear part
+            @test P.xlin[:, 4] == P.xmatrix[:, 4]
+            @test P.zmatrix[:, 1] == P.xmatrix[:, 1]     # Z keeps the real column
+            @test P.rfx_sgn == [1.0, 1.0]
+
+            Pn, _, _ = _ln_setup([:x2 => :neg_lognormal])
+            @test Pn.rfx_sgn == [-1.0]
+            @test all(Pn.xlin[:, 2] .== 0)
+        end
+
+        # -------------------------------------------------------------------
+        @testset "gradient vs finite differences" begin
+            specs = [[:x1 => :lognormal],
+                     [:x1 => :neg_lognormal],
+                     [:x1 => :lognormal, :x2 => :lognormal],
+                     [:x1 => :lognormal, :x3 => :normal],
+                     [:x2 => :normal, :x1 => :neg_lognormal, :x3 => :lognormal]]
+
+            for (si, rfx) in enumerate(specs)
+                P, buf, gw = _ln_setup(rfx)
+                M = length(rfx)
+                rng = MersenneTwister(3000 + si)
+                for _ in 1:4
+                    # mu is on the LOG scale, so keep it modest: exp() of a wild
+                    # draw would swamp the finite-difference comparison.
+                    θ = [0.5 .* randn(rng, 4); 0.2 .+ 0.6 .* abs.(randn(rng, M))]
+                    G = zeros(length(θ))
+                    LT._rfx_fg!(true, G, copy(θ), P, buf, gw)
+                    fd = FiniteDiff.finite_difference_gradient(
+                            t -> LT._rfx_fg!(true, nothing, collect(t), P, buf, gw), θ)
+                    @test maximum(abs.(G .- fd) ./ max.(1.0, abs.(fd))) < 1e-6
+                end
+            end
+        end
+
+        @testset "gradient with a ragged panel" begin
+            rng = MersenneTwister(451)
+            N, K = 50, 4
+            Ti = rand(rng, 2:9, N)
+            df = DataFrame(personid = vcat([fill(i, Ti[i]) for i in 1:N]...))
+            nobs = nrow(df)
+            for k in 1:K; df[!, Symbol("x", k)] = randn(rng, nobs); end
+            df.pick1 = Float64.(rand(rng, nobs) .< 0.5)
+            df = df[shuffle(rng, 1:nobs), :]
+
+            formula = [Symbol("x", k) for k in 1:K]
+            rfx = [:x1 => :lognormal, :x3 => :normal]
+            P, _ = LT._prep_logit2_rfx(df, formula, :pick1, :personid, rfx, 64,
+                                       20260808, nothing)
+            gw  = 0.3 .+ 1.5 .* rand(MersenneTwister(7), P.N)
+            buf = LT.RfxBuffers(P)
+
+            θ = [-0.4, -0.6, 0.45, 0.1, 0.7, 0.35]
+            G = zeros(6)
+            LT._rfx_fg!(true, G, copy(θ), P, buf, gw)
+            fd = FiniteDiff.finite_difference_gradient(
+                    t -> LT._rfx_fg!(true, nothing, collect(t), P, buf, gw), θ)
+            @test maximum(abs.(G .- fd) ./ max.(1.0, abs.(fd))) < 1e-6
+        end
+
+        # -------------------------------------------------------------------
+        @testset "mirror symmetry Q(mu, s) == Q(mu, -s)" begin
+            # Holds for the lognormal families too, because antithetic draws make
+            # the draw set symmetric. This is what justifies keeping the abs()
+            # canonicalisation and the percentile CIs on the sigma rows.
+            P, buf, gw = _ln_setup([:x1 => :lognormal, :x2 => :neg_lognormal])
+            Qp = LT._rfx_fg!(true, nothing, [0.3, -0.2, 0.4, 0.1,  0.7, -0.45], P, buf, gw)
+            Qm = LT._rfx_fg!(true, nothing, [0.3, -0.2, 0.4, 0.1, -0.7,  0.45], P, buf, gw)
+            @test abs(Qp - Qm) < 1e-12
+        end
+
+        @testset "sigma = 0 is still a stationary point" begin
+            P, buf, gw = _ln_setup([:x1 => :lognormal, :x3 => :neg_lognormal])
+            G = zeros(6)
+            LT._rfx_fg!(true, G, [0.3, -0.2, 0.4, 0.1, 0.0, 0.0], P, buf, gw)
+            @test maximum(abs.(G[5:6])) < 1e-10
+        end
+
+        @testset "sigma = 0 reduces to plain logit at beta = +/-exp(mu)" begin
+            # The strongest check on the linear index: at sigma = 0 a lognormal
+            # coefficient is the constant +/-exp(mu), so the objective must equal
+            # the plain logit objective at that beta. Catches a double count (xlin
+            # not zeroed) or a dropped level, in either direction.
+            P, buf, gw = _ln_setup([:x1 => :lognormal, :x3 => :neg_lognormal])
+            μ = [0.35, -0.7, 0.2, 0.9]
+            Q = LT._rfx_fg!(true, nothing, [μ; 0.0; 0.0], P, buf, gw)
+
+            β = copy(μ)
+            β[1] =  exp(μ[1])
+            β[3] = -exp(μ[3])
+            wobs = zeros(size(P.xmatrix, 1))
+            for (i, rg) in enumerate(P.ranges); wobs[rg] .= gw[i]; end
+            Qplain = LT.minus_ll(β, P.yvec, P.xmatrix, similar(P.yvec), wobs)
+            @test abs(Q - Qplain) < 1e-9
+        end
+
+        # -------------------------------------------------------------------
+        @testset "theta0_rfx converts a level b0 to the log scale" begin
+            myxs = [:x1, :x2, :x3]
+            b0   = [0.8, -0.5, 1.6]
+            s0   = [0.6, 0.4]
+
+            th = theta0_rfx(myxs, [:x1 => :lognormal, :x2 => :neg_lognormal];
+                            b0 = b0, s0 = s0)
+            # the IMPLIED MEAN coefficient equals the level b0 that went in
+            @test  exp(th[1] + s0[1]^2 / 2) ≈ b0[1]
+            @test -exp(th[2] + s0[2]^2 / 2) ≈ b0[2]
+            @test th[3] == b0[3]                       # not a random coefficient
+            @test th[4:5] == s0
+
+            # normal coefficients are passed through exactly as before
+            @test theta0_rfx(myxs, [:x1, :x2]; b0 = b0, s0 = s0) == [b0; s0]
+            @test theta0_rfx(myxs, [:x1 => :normal, :x2]; b0 = b0, s0 = s0) == [b0; s0]
+
+            # b0 must carry the sign the support allows, and cannot be zero
+            @test_throws ErrorException theta0_rfx(myxs, [:x2 => :lognormal];     b0 = b0)
+            @test_throws ErrorException theta0_rfx(myxs, [:x1 => :neg_lognormal]; b0 = b0)
+            @test_throws ErrorException theta0_rfx(myxs, [:x1 => :lognormal])   # b0 = zeros
+        end
+
+        # -------------------------------------------------------------------
+        @testset "_rfx_to_level matches simulation" begin
+            K     = 3
+            pairs = [:x1 => :lognormal, :x3 => :neg_lognormal]
+            cols  = [1, 3]
+            θ     = [-0.3, 0.55, 0.4, 0.65, 0.25]
+            lvl   = LT._rfx_to_level(θ, K, pairs, cols)
+
+            @test lvl[2] == θ[2]                          # untouched
+            rng = MersenneTwister(4242)
+            for (m, (_, d)) in enumerate(pairs)
+                k = cols[m]
+                s = d === :neg_lognormal ? -1.0 : 1.0
+                draws = s .* exp.(θ[k] .+ θ[K + m] .* randn(rng, 1_000_000))
+                @test isapprox(lvl[k],     mean(draws); rtol = 1e-2)
+                @test isapprox(lvl[K + m], std(draws);  rtol = 2e-2)
+            end
+            # SD is positive on both supports; the mean carries the sign
+            @test lvl[1] > 0 && lvl[3] < 0
+            @test lvl[K + 1] > 0 && lvl[K + 2] > 0
+
+            # tiny sigma: SD -> sigma * |E|, which is where exp(s^2) - 1 would have
+            # lost every significant digit and expm1 does not
+            small = LT._rfx_to_level([0.0, 0.0, 0.0, 1e-7, 1e-7], K, pairs, cols)
+            @test isapprox(small[K + 1], 1e-7; rtol = 1e-6)
+        end
+
+        # -------------------------------------------------------------------
+        @testset "overflow is reported, not silently NaN" begin
+            P, buf, gw = _ln_setup([:x1 => :lognormal])
+            θ = [800.0, 0.0, 0.0, 0.0, 0.5]        # exp(800) = Inf
+            @test_throws ErrorException LT._rfx_fg!(true, zeros(5), copy(θ), P, buf, gw)
+
+            f = LT._logit2_rfx(P, θ, gw, Optim.Options())
+            @test f.errored
+            @test occursin("lognormal", f.error_message)
+            @test all(isnan, f.theta_hat)
+        end
+
+        # -------------------------------------------------------------------
+        @testset "reporting: level moments in regtable_rfx and boot_report" begin
+            N, T, K = 120, 8, 3
+            rng = MersenneTwister(99)
+            df = DataFrame(personid = repeat(1:N, inner = T))
+            for k in 1:K; df[!, Symbol("x", k)] = randn(rng, N * T); end
+            X  = Matrix(df[:, [:x1, :x2, :x3]])
+            b1 = repeat(exp.(log(0.8) .+ 0.5 .* randn(rng, N)), inner = T)
+            v  = b1 .* X[:, 1] .- 0.9 .* X[:, 2] .+ 0.4 .* X[:, 3]
+            df.pick1 = Float64.(rand(rng, N * T) .< (1 ./ (1 .+ exp.(-v))))
+
+            myxs  = [:x1, :x2, :x3]
+            plain = logit2(copy(df), myxs, :pick1, zeros(K))
+
+            myrfx = [:x1 => :lognormal]
+            th0   = theta0_rfx(myxs, myrfx; b0 = plain.theta_hat)
+            fit   = logit2_rfx(df, myxs, :pick1, :personid, th0;
+                               rfx = myrfx, ndraws = 100, seed = 7)
+            @test fit.converged && !fit.errored
+            fit.vcov = boot_logit2_rfx(df, myxs, :pick1, :personid, th0;
+                                       rfx = myrfx, ndraws = 100, seed = 7,
+                                       nboot = 20, parallel = false,
+                                       theta_start = fit.theta_hat)
+            @test fit.extra.rfx      == [:x1 => :lognormal]
+            @test fit.extra.rfx_cols == [1]
+            @test fit.theta_names    == ["x1", "x2", "x3", "sd_x1"]   # names unchanged
+
+            # ---- rfx_level_moments -----------------------------------------
+            lm = rfx_level_moments(fit)
+            @test nrow(lm) == 3
+            @test lm.quantity == ["mean", "median", "SD"]
+            @test all(lm.variable .== :x1)
+            @test lm.estimate[1] ≈ exp(fit.theta_hat[1] + fit.theta_hat[4]^2 / 2)
+            @test lm.estimate[2] ≈ exp(fit.theta_hat[1])
+            @test all(lm.estimate .> 0)
+            @test all(lm.ci_lo .<= lm.estimate .<= lm.ci_hi)
+            @test all(lm.boot_se .> 0)
+            @test lm.n_nonfinite == [0, 0, 0]     # this fit is well behaved
+
+            # a normal fit gets zero rows, so the call is safe unconditionally
+            th0n = theta0_rfx(myxs, [:x1]; b0 = plain.theta_hat)
+            fitn = logit2_rfx(df, myxs, :pick1, :personid, th0n;
+                              rfx = [:x1], ndraws = 100, seed = 7)
+            fitn.vcov = boot_logit2_rfx(df, myxs, :pick1, :personid, th0n;
+                                        rfx = [:x1], ndraws = 100, seed = 7,
+                                        nboot = 20, parallel = false,
+                                        theta_start = fitn.theta_hat)
+            @test nrow(rfx_level_moments(fitn)) == 0
+
+            # ---- the table shows LEVEL moments, not mu / sigma_log ----------
+            d = LT._rfx_table_stats(fit, [2.5, 97.5])
+            @test d.is_log_row == [true, false, false, true]
+            @test d.is_sd      == [false, false, false, true]
+            @test d.coef[1] ≈ exp(fit.theta_hat[1] + fit.theta_hat[4]^2 / 2)
+            @test d.coef[2:3] == fit.theta_hat[2:3]
+            @test d.coef[4] ≈ d.coef[1] * sqrt(expm1(fit.theta_hat[4]^2))
+            @test all(isfinite, d.se) && all(d.se .> 0)
+            @test all(d.ci_lo .<= d.coef .<= d.ci_hi)
+
+            # a normal fit's stats are unchanged: coef is theta_hat, se is diag(V)
+            dn = LT._rfx_table_stats(fitn, [2.5, 97.5])
+            @test dn.coef == collect(Float64, fitn.theta_hat)
+            @test !any(dn.is_log_row)
+            @test dn.se ≈ [sqrt(LT.vcov(fitn)[j, j]) for j in 1:4]
+
+            # renders, and carries a bracketed interval on the SD row
+            tab = sprint(show, regtable_rfx(fit))
+            @test occursin("x1", tab)
+            @test occursin("[", tab)
+            # stars are suppressed on the two lognormal rows by default
+            @test sprint(show, regtable_rfx(fit; stars_for_lognormal = true)) != tab
+            @test !isnothing(regtable_rfx(fit; render = LatexTable()))
+
+            # ---- estimated log-scale parameters in extralines ---------------
+            ps = LT._rfx_log_param_stats(fit, [2.5, 97.5])
+            @test length(ps) == 1
+            @test ps[1].var == :x1
+            @test ps[1].mu == fit.theta_hat[1]          # the ESTIMATED mu, untransformed
+            @test ps[1].sd == fit.theta_hat[4]
+            @test ps[1].mu_se > 0 && ps[1].sd_se > 0
+            @test ps[1].sd_lo <= ps[1].sd <= ps[1].sd_hi
+            @test isempty(LT._rfx_log_param_stats(fitn, [2.5, 97.5]))   # normal fit
+
+            @test ps[1].mu_lo <= ps[1].mu <= ps[1].mu_hi
+
+            rows = LT._rfx_log_param_rows([fit], nothing, [2.5, 97.5], 2, 2, true)
+            @test length(rows) == 3                     # header + mu + sigma
+            @test all(r -> length(r) == 2, rows)        # label + one column
+            @test occursin("mu", rows[2][1])
+            @test occursin("[", rows[2][2])             # ci_for_sd: mu gets an interval
+            @test occursin("[", rows[3][2])             # sigma likewise
+            @test startswith(rows[2][2], LT._rfx_num(fit.theta_hat[1], 2))
+            # ci_for_sd = false switches both to standard errors
+            rows_se = LT._rfx_log_param_rows([fit], nothing, [2.5, 97.5], 2, 2, false)
+            @test occursin("(", rows_se[2][2]) && !occursin("[", rows_se[2][2])
+            @test occursin("(", rows_se[3][2]) && !occursin("[", rows_se[3][2])
+            # labels are honoured
+            rows_lab = LT._rfx_log_param_rows([fit], Dict("x1" => "First"),
+                                              [2.5, 97.5], 2, 2, true)
+            @test occursin("First", rows_lab[2][1])
+            # a column with no lognormal coefficient gets a blank cell
+            rows2 = LT._rfx_log_param_rows([fitn, fit], nothing, [2.5, 97.5], 2, 2, true)
+            @test all(r -> length(r) == 3, rows2)
+            @test rows2[2][2] == "" && rows2[2][3] != ""
+
+            # the rows reach the rendered table, ahead of the caller's extralines
+            tab_lp = sprint(show, regtable_rfx(fit; digits = 2, digits_stats = 2,
+                                               extralines = [["Draws", "100"]]))
+            @test occursin("Log-scale parameters", tab_lp)
+            @test findfirst("Log-scale parameters", tab_lp)[1] <
+                  findfirst("Draws", tab_lp)[1]
+            # opt out
+            @test !occursin("Log-scale parameters",
+                            sprint(show, regtable_rfx(fit; log_params = false)))
+            # a purely normal table is untouched by the feature
+            @test !occursin("Log-scale parameters", sprint(show, regtable_rfx(fitn)))
+
+            # ---- boot_report carries BOTH scales ---------------------------
+            rep = boot_report(fit)
+            @test "dist"  in names(rep)
+            @test "scale" in names(rep)
+            @test rep.scale == ["log", "level", "level", "log", "level", "level", "level"]
+            @test rep.dist[1] == :lognormal && rep.dist[4] == :lognormal
+            @test rep.dist[2] == :none
+            @test rep.estimate[1] == fit.theta_hat[1]     # the ESTIMATED mu, not E[b]
+            @test rep.estimate[4] == fit.theta_hat[4]     # the ESTIMATED sigma_log
+            @test nrow(rep) == 4 + 3
+            @test rep.param[5:7] == ["mean[x1]", "median[x1]", "SD[x1]"]
+            @test rep.is_sd[5:7] == [false, false, true]
+
+            @test "n_nonfinite" in names(rep)
+            @test all(rep.n_nonfinite .== 0)
+
+            # a normal fit keeps one row per parameter, every scale "level"
+            repn = boot_report(fitn)
+            @test nrow(repn) == 4
+            @test all(repn.scale .== "level")
+            @test repn.dist == [:normal, :none, :none, :normal]
+
+            # ---- overflow in the level transform ----------------------------
+            # A converged replicate can sit in the flat mu/sigma ridge, where a large
+            # sigma is offset by a very negative mu; exp(mu + sigma^2/2) is then not
+            # representable. Reported statistics must degrade visibly, never silently.
+            @testset "level transform overflow" begin
+                se, nbad = LT._rfx_boot_se([1.0 2.0; 3.0 Inf; 5.0 4.0])
+                @test nbad == [0, 1]
+                @test se[1] ≈ std([1.0, 3.0, 5.0])
+                @test se[2] ≈ std([2.0, 4.0])          # finite part only, not NaN
+                @test isfinite(se[2])
+
+                # fewer than two finite values is NaN, not an error
+                se2, nbad2 = LT._rfx_boot_se(reshape([Inf, Inf, 1.0], 3, 1))
+                @test nbad2 == [2] && isnan(se2[1])
+
+                # end to end: poison one replicate so its level moment overflows
+                fbad = deepcopy(fit)
+                fbad.vcov.theta_boot_table[1, 4] = 40.0   # sigma_log = 40 -> exp(800)
+                lmb = rfx_level_moments(fbad)
+                @test lmb.n_nonfinite[1] == 1            # mean[x1] overflowed
+                @test lmb.n_nonfinite[3] == 1            # SD[x1] too
+                @test lmb.n_nonfinite[2] == 0            # median = exp(mu), unaffected
+                @test !any(isnan, lmb.boot_se)            # finite-filtered rules out NaN (Inf still possible)
+                @test all(isfinite, lmb.ci_lo)           # the lower bound is untouched
+
+                # A percentile is robust to the overflowing draws only while their
+                # SHARE stays below the tail probability. Here 1 of 20 replicates is
+                # 5% > 2.5%, so the 97.5th percentile is genuinely Inf -- an honest
+                # "not bounded above by the bootstrap", not a bug. n_nonfinite is how
+                # the caller knows to expect it.
+                @test !isfinite(lmb.ci_hi[1])
+                @test isfinite(lmb.ci_hi[2])             # median row unaffected
+                # widen the tail past the overflow share and the bound returns
+                lmb90 = rfx_level_moments(fbad; ci_levels = [5.0, 90.0])
+                @test all(isfinite, lmb90.ci_hi)
+
+                # the table still renders and warns rather than printing a bare NaN
+                dbad = (@test_logs (:warn, r"overflow") LT._rfx_table_stats(fbad, [5.0, 90.0]))
+                @test all(isfinite, dbad.se)
+                @test all(isfinite, dbad.ci_lo) && all(isfinite, dbad.ci_hi)
+            end
+        end
+
+        # -------------------------------------------------------------------
+        @testset "recovery with a lognormal coefficient (slow)" begin
+            N, T, K = 400, 21, 3
+            μ1, σ1  = log(0.7), 0.5
+            βrest   = [-0.9, 0.4]
+
+            rng = MersenneTwister(77)
+            df = DataFrame(personid = repeat(1:N, inner = T))
+            for k in 1:K; df[!, Symbol("x", k)] = randn(rng, N * T); end
+            X  = Matrix(df[:, [:x1, :x2, :x3]])
+            b1 = repeat(exp.(μ1 .+ σ1 .* randn(rng, N)), inner = T)
+            v  = b1 .* X[:, 1] .+ βrest[1] .* X[:, 2] .+ βrest[2] .* X[:, 3]
+            df.pick1 = Float64.(rand(rng, N * T) .< (1 ./ (1 .+ exp.(-v))))
+
+            myxs  = [:x1, :x2, :x3]
+            plain = logit2(copy(df), myxs, :pick1, zeros(K))
+            th0   = theta0_rfx(myxs, [:x1 => :lognormal]; b0 = plain.theta_hat)
+            fit   = logit2_rfx(df, myxs, :pick1, :personid, th0;
+                               rfx = [:x1 => :lognormal], ndraws = 500, seed = 20260808)
+
+            @test fit.converged && !fit.errored
+            @test abs(fit.theta_hat[1] - μ1) < 0.12       # mu of log(beta)
+            @test abs(fit.theta_hat[4] - σ1) < 0.12       # sigma of log(beta)
+            @test maximum(abs.(fit.theta_hat[2:3] .- βrest)) < 0.15
+        end
     end
 end

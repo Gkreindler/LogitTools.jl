@@ -5,8 +5,19 @@
 #
 # Model (group i, observation t, draw r, q_it = 2*y_it - 1):
 #
-#   v_itr = X_it'β + Σ_m σ_m · Z_itm · η_irm        η_ir ~ N(0, I_M)
+#   v_itr = Σ_{k not lognormal-rfx} β_k·X_itk + Σ_m β_irm · Z_itm
 #   λ_itr = Λ(q_it · v_itr)
+#
+# with η_ir ~ N(0, I_M) and, per rfx variable m,
+#
+#   :normal         β_irm =  μ_m + σ_m·η_irm       (μ_m enters through X'β)
+#   :lognormal      β_irm =  exp(μ_m + σ_m·η_irm)
+#   :neg_lognormal  β_irm = -exp(μ_m + σ_m·η_irm)
+#
+# For the lognormal families μ_m is the mean of log|β_irm| and that variable's X
+# column is dropped from the linear part (the exp() already carries the level),
+# so θ = [μ (K); σ (M)] in every case. The σ = 0 saddle and the σ -> -σ mirror
+# symmetry hold for all three: with antithetic draws {η_r} = {-η_r} as a set.
 #   ℓ_ir  = Σ_t log λ_itr
 #   log L̂_i = logsumexp_r(ℓ_ir + logw_r)
 #
@@ -64,6 +75,8 @@ bootstrap, and abstract fields would also deoptimise the inner loop.
 """
 struct RfxPrep
     xmatrix::Matrix{Float64}          # Nobs × K, sorted by col_id
+    xlin::Matrix{Float64}             # xmatrix with lognormal-rfx columns zeroed;
+                                      # === xmatrix when any_log is false
     zmatrix::Matrix{Float64}          # Nobs × M, sorted by col_id
     yvec::Vector{Float64}             # Nobs
     q::Vector{Float64}                # Nobs, = 2y - 1
@@ -77,17 +90,40 @@ struct RfxPrep
     N::Int
     Tmax::Int
     rfx_pairs::Vector{Pair{Symbol,Symbol}}
+    rfx_cols::Vector{Int}             # formula index of each rfx variable
+    rfx_islog::Vector{Bool}           # lognormal family?
+    rfx_sgn::Vector{Float64}          # +1, or -1 for :neg_lognormal
+    any_log::Bool                     # gates every lognormal code path
     theta_names::Vector{String}
     col_id::Symbol
     seed::Int
 end
 
+"""Distributions accepted in `rfx`. A bare symbol in `rfx` means `:normal`."""
+const _RFX_DISTS = (:normal, :lognormal, :neg_lognormal)
+
+"""Is `d` a lognormal family, i.e. parameterised on the log scale?"""
+_rfx_is_log(d::Symbol) = (d === :lognormal) || (d === :neg_lognormal)
+
+"""Sign of the coefficient's support: `-1.0` for `:neg_lognormal`, else `+1.0`."""
+_rfx_sign(d::Symbol) = d === :neg_lognormal ? -1.0 : 1.0
+
 """
     _normalize_rfx(rfx) -> Vector{Pair{Symbol,Symbol}}
 
-Accept `[:dur, :dist]` or `[:dur => :normal, ...]` and normalise to pairs.
-Only `:normal` is supported today; this is the extension point for lognormal
-coefficients later.
+Accept `[:dur, :dist]` or `[:dur => :normal, :tfx => :lognormal, ...]` and
+normalise to pairs. A bare symbol means `:normal`, so every call written before
+the lognormal families existed keeps its meaning exactly.
+
+Supported distributions, for the coefficient `β_im` on rfx variable `m`:
+
+    :normal         β_im =  μ_m + σ_m·η_im          support ℝ
+    :lognormal      β_im =  exp(μ_m + σ_m·η_im)     support (0, ∞)
+    :neg_lognormal  β_im = -exp(μ_m + σ_m·η_im)     support (-∞, 0)
+
+In all three cases `θ = [μ (K); σ (M)]`, but for the lognormal families `μ_m`
+and `σ_m` are the mean and standard deviation of `log|β_im|`, **not** of `β_im`
+itself. Use [`rfx_level_moments`](@ref) to get the level moments.
 """
 function _normalize_rfx(rfx)
     pairs = Pair{Symbol,Symbol}[]
@@ -100,8 +136,9 @@ function _normalize_rfx(rfx)
     end
 
     for (v, d) in pairs
-        d === :normal || error(
-            "rfx distribution :$d is not supported for variable :$v. Only :normal is implemented.")
+        d in _RFX_DISTS || error(
+            "rfx distribution :$d is not supported for variable :$v. " *
+            "Supported: $(join(string.(":", _RFX_DISTS), ", ")).")
     end
 
     return pairs
@@ -110,10 +147,24 @@ end
 """
     theta0_rfx(formula, rfx; b0, s0) -> Vector{Float64}
 
-Assemble a starting vector `[β; σ]` for `logit2_rfx`.
+Assemble a starting vector `[μ; σ]` for `logit2_rfx`.
 
 Default `s0 = 0.5`, never `0.0`: σ = 0 is a stationary point (a saddle) of the
 simulated likelihood, so an optimiser started there cannot move.
+
+`b0` is given on the **level** scale for every variable — the scale of a plain
+`logit2` coefficient — including the lognormal ones. For a `:lognormal` or
+`:neg_lognormal` rfx variable at formula position `k`, this function converts it
+into the log scale that `logit2_rfx` actually estimates:
+
+    μ_k = log|b0_k| - s0_m^2 / 2
+
+which is the value whose implied mean coefficient `±exp(μ + σ²/2)` equals `b0_k`.
+Passing `log(b0_k)` yourself would instead start at a mean of `b0_k·exp(σ²/2)`.
+
+For a lognormal variable `b0_k` must therefore be nonzero and carry the sign its
+support allows (`> 0` for `:lognormal`, `< 0` for `:neg_lognormal`), so the
+default `b0 = zeros(K)` cannot be used there — pass a plain `logit2` `theta_hat`.
 """
 function theta0_rfx(formula, rfx;
                     b0 = zeros(length(formula)),
@@ -125,7 +176,34 @@ function theta0_rfx(formula, rfx;
     length(b0) == K || error("b0 has length $(length(b0)) but formula has $K variables")
     length(s0) == M || error("s0 has length $(length(s0)) but rfx has $M variables")
 
-    return Float64[b0...; s0...]
+    th = Float64[b0...; s0...]
+
+    # Translate level starts into the log scale for the lognormal families. Done
+    # here rather than inside the fit so that `b0` means one thing (a level
+    # coefficient) whatever the mix of distributions, and so a wrong sign is
+    # caught before any optimisation is paid for.
+    rfx_pairs    = _normalize_rfx(rfx)
+    formula_syms = Symbol.(formula)
+    for (m, (v, d)) in enumerate(rfx_pairs)
+        _rfx_is_log(d) || continue
+
+        k = findfirst(==(v), formula_syms)
+        isnothing(k) && error(
+            "rfx variable :$v is not in formula. Available: $(formula_syms)")
+
+        sgn = _rfx_sign(d)
+        b   = sgn * th[k]
+        b > 0 || error(
+            "rfx variable :$v is :$d, whose support is " *
+            (sgn > 0 ? "(0, ∞)" : "(-∞, 0)") * ", but b0[$k] = $(th[k]). " *
+            "Pass a level starting value with the right sign — e.g. the matching " *
+            "coefficient from a plain logit2 fit. The default b0 = zeros(K) cannot be " *
+            "used with a lognormal random coefficient.")
+
+        th[k] = log(b) - s0[m]^2 / 2
+    end
+
+    return th
 end
 
 """
@@ -181,6 +259,26 @@ function _prep_logit2_rfx(
     zcols = [findfirst(==(s), formula_syms) for s in rfx_syms]
     zmatrix = M == 0 ? Matrix{Float64}(undef, size(xmatrix, 1), 0) :
                        Matrix{Float64}(xmatrix[:, zcols])
+
+    # --- lognormal bookkeeping ---------------------------------------------
+    # `any_log` gates every lognormal branch, so a model with only normal
+    # coefficients runs the identical arithmetic on the identical memory it ran
+    # before the lognormal families existed.
+    rfx_islog = Bool[_rfx_is_log(d)  for (_, d) in rfx_pairs]
+    rfx_sgn   = Float64[_rfx_sign(d) for (_, d) in rfx_pairs]
+    any_log   = any(rfx_islog)
+
+    # A lognormal coefficient carries its own level inside exp(μ + σ·η), so that
+    # variable's column must NOT also enter the linear X'β term: it would be
+    # counted twice and μ would not be identified. Alias when there is nothing to
+    # zero out.
+    xlin = xmatrix
+    if any_log
+        xlin = copy(xmatrix)
+        for m in findall(rfx_islog)
+            @views xlin[:, zcols[m]] .= 0.0
+        end
+    end
 
     # --- outcome ------------------------------------------------------------
     yvec = Float64.(data_df[perm, Symbol(choice)])
@@ -265,8 +363,9 @@ function _prep_logit2_rfx(
     theta_names = [string.(formula_syms); "sd_" .* string.(rfx_syms)]
 
     P = RfxPrep(
-        xmatrix, zmatrix, yvec, q, ranges, eta, logw, group_ids,
-        K, M, ndraws, N, Tmax, rfx_pairs, theta_names, col_id, seed)
+        xmatrix, xlin, zmatrix, yvec, q, ranges, eta, logw, group_ids,
+        K, M, ndraws, N, Tmax, rfx_pairs, zcols, rfx_islog, rfx_sgn, any_log,
+        theta_names, col_id, seed)
 
     return P, gw
 end
@@ -302,6 +401,57 @@ function RfxBuffers(P::RfxPrep)
         Vector{Float64}(undef, P.Tmax),
         Vector{Float64}(undef, P.Tmax),
     )
+end
+
+
+# ----------------------------------------------------------------------------
+# Draw-specific coefficients
+# ----------------------------------------------------------------------------
+
+"""
+    _rfx_fill_A!(buf, β, σ, ηi, P)
+
+Fill `buf.A` (M × R) with the quantity that multiplies `Zi` in the linear index,
+
+    :normal          A[m,r] = σ_m · η_mr                      (deviation from μ_m)
+    :lognormal       A[m,r] = ±exp(μ_m + σ_m · η_mr)          (the coefficient itself)
+
+so that `Vi = Zi * A .+ Xlin * β` holds for any mix of distributions. `Xlin` has
+the lognormal columns zeroed, which is why the second row is the whole
+coefficient and not a deviation. The sign of `:neg_lognormal` is folded into `A`,
+so nothing downstream needs to know about it.
+
+The `any_log == false` branch is the original one-line broadcast, unchanged, and
+is what runs whenever `rfx` contains no lognormal entry.
+"""
+@inline function _rfx_fill_A!(buf::RfxBuffers, β, σ, ηi, P::RfxPrep)
+
+    if !P.any_log
+        buf.A .= σ .* ηi
+        return nothing
+    end
+
+    @inbounds for r in 1:P.R, m in 1:P.M
+        buf.A[m, r] = P.rfx_islog[m] ?
+            P.rfx_sgn[m] * exp(β[P.rfx_cols[m]] + σ[m] * ηi[m, r]) :
+            σ[m] * ηi[m, r]
+    end
+
+    # exp() overflows to Inf above an exponent of ~709, and Inf then propagates
+    # into the gradient as Inf·0 = NaN, from which LBFGS cannot recover -- it
+    # would report a converged fit at a garbage θ. Fail with the cause named
+    # instead. O(M·R) with M small, so this is free next to the T_i × R work.
+    if !all(isfinite, buf.A)
+        lg = findall(P.rfx_islog)
+        error("a lognormal random coefficient overflowed: exp(μ + σ·η) is not finite " *
+              "at μ = $(round.([β[P.rfx_cols[m]] for m in lg], digits = 3)), " *
+              "σ = $(round.([σ[m] for m in lg], digits = 3)) " *
+              "(variables $(first.(P.rfx_pairs)[lg])). μ is on the LOG scale for a " *
+              "lognormal coefficient: build theta0 with theta0_rfx, which converts a " *
+              "level b0 for you.")
+    end
+
+    return nothing
 end
 
 
@@ -346,7 +496,7 @@ function _rfx_fg!(F, G, θ::Vector{Float64}, P::RfxPrep, buf::RfxBuffers,
         Ti  = length(rng)
         ω_i = isnothing(gw) ? 1.0 : gw[i]
 
-        Xi = view(P.xmatrix, rng, :)      # Ti × K
+        Xi = view(P.xlin,    rng, :)      # Ti × K (lognormal columns zeroed)
         Zi = view(P.zmatrix, rng, :)      # Ti × M
         qi = view(P.q,       rng)         # Ti
         ηi = view(P.eta, :, :, i)         # M × R (contiguous)
@@ -359,9 +509,9 @@ function _rfx_fg!(F, G, θ::Vector{Float64}, P::RfxPrep, buf::RfxBuffers,
         # --- 1. linear index ------------------------------------------------
         mul!(xb, Xi, β)                   # Ti
         if M > 0
-            buf.A .= σ .* ηi              # M × R
-            mul!(Vi, Zi, buf.A)           # Ti × R
-            Vi .+= xb                     # broadcast down columns
+            _rfx_fill_A!(buf, β, σ, ηi, P)   # M × R
+            mul!(Vi, Zi, buf.A)              # Ti × R
+            Vi .+= xb                        # broadcast down columns
         else
             Vi .= xb
         end
@@ -389,8 +539,26 @@ function _rfx_fg!(F, G, θ::Vector{Float64}, P::RfxPrep, buf::RfxBuffers,
             if M > 0
                 mul!(buf.S, Zi', Ei)                   # M × R  S_mr = Σ_t Z_itm e_itr
                 # r outer / m inner: buf.S and ηi are M × R and column-major
-                for r in 1:R, m in 1:M
-                    gσ[m] -= ω_i * buf.pw[r] * ηi[m, r] * buf.S[m, r]
+                if !P.any_log
+                    for r in 1:R, m in 1:M
+                        gσ[m] -= ω_i * buf.pw[r] * ηi[m, r] * buf.S[m, r]
+                    end
+                else
+                    # Both lognormal derivatives reuse the same S. With
+                    # A_mr = ±exp(μ_m + σ_m·η_mr):
+                    #   ∂v_itr/∂σ_m = η_mr · A_mr · Z_itm      (:normal: η_mr · Z_itm)
+                    #   ∂v_itr/∂μ_m =         A_mr · Z_itm
+                    # μ_m lives at β position rfx_cols[m], where the Xi'ē term
+                    # above contributed nothing because that column is zeroed.
+                    for r in 1:R, m in 1:M
+                        c = ω_i * buf.pw[r] * buf.S[m, r]
+                        if P.rfx_islog[m]
+                            gσ[m]             -= c * ηi[m, r] * buf.A[m, r]
+                            gβ[P.rfx_cols[m]] -= c * buf.A[m, r]
+                        else
+                            gσ[m] -= c * ηi[m, r]
+                        end
+                    end
                 end
             end
         end
@@ -427,7 +595,7 @@ function _rfx_ess(θ::Vector{Float64}, P::RfxPrep, buf::RfxBuffers)
         rng = P.ranges[i]
         Ti  = length(rng)
 
-        Xi = view(P.xmatrix, rng, :)
+        Xi = view(P.xlin,    rng, :)
         Zi = view(P.zmatrix, rng, :)
         qi = view(P.q,       rng)
         ηi = view(P.eta, :, :, i)
@@ -437,7 +605,7 @@ function _rfx_ess(θ::Vector{Float64}, P::RfxPrep, buf::RfxBuffers)
 
         mul!(xb, Xi, β)
         if M > 0
-            buf.A .= σ .* ηi
+            _rfx_fill_A!(buf, β, σ, ηi, P)
             mul!(Vi, Zi, buf.A)
             Vi .+= xb
         else
@@ -523,7 +691,8 @@ function _logit2_rfx(
             iteration_limit_reached = Optim.iteration_limit_reached(opt),
             time_it_took = time_it_took,
             extra = (; n_groups = P.N, K = P.K, M = P.M, R = P.R,
-                       col_id = P.col_id, rfx = P.rfx_pairs, seed = P.seed,
+                       col_id = P.col_id, rfx = P.rfx_pairs,
+                       rfx_cols = P.rfx_cols, seed = P.seed,
                        ess_min = ess_min, ess_p10 = ess_p10,
                        ess_median = ess_median, ess_mean = ess_mean,
                        Ti_min = minimum(Ti), Ti_median = median(Ti),
@@ -569,8 +738,10 @@ too easy to transpose silently.
 - `theta0`: starting values, length `K + M`. See [`theta0_rfx`](@ref).
 
 # Keywords
-- `rfx = Symbol[]`: subset of `formula` carrying random coefficients. Also accepts
-  `[:dur => :normal]` form; only `:normal` is implemented.
+- `rfx = Symbol[]`: subset of `formula` carrying random coefficients. A bare
+  symbol means `:normal`; `[:dur => :lognormal]` form selects a distribution per
+  variable from `:normal`, `:lognormal` (support `(0, ∞)`) and `:neg_lognormal`
+  (support `(-∞, 0)`). See "Lognormal coefficients" below.
 - `ndraws = 1000`: number of simulation draws, must be even (antithetic pairing).
 - `seed = 20260808`: draw seed. Draws are generated once and reused for every
   function evaluation, so the objective is a deterministic function of θ.
@@ -581,11 +752,33 @@ too easy to transpose silently.
   which is what you want when debugging a fit that will not run.
 
 # Parameter ordering
-`θ = [β (K, in formula order); σ (M, in the order listed in rfx)]`, named
-`[formula...; "sd_" .* rfx...]`.
+`θ = [μ (K, in formula order); σ (M, in the order listed in rfx)]`, named
+`[formula...; "sd_" .* rfx...]`. For a `:normal` coefficient `μ` is the mean of
+the coefficient, which is the usual `β`.
 
-Returned `σ` is always `≥ 0`: the likelihood satisfies `Q(β, σ) = Q(β, -σ)`, so
-there are `2^M` mirror optima and the sign is not identified.
+Returned `σ` is always `≥ 0`: the likelihood satisfies `Q(μ, σ) = Q(μ, -σ)`, so
+there are `2^M` mirror optima and the sign is not identified. This holds for the
+lognormal families too, because antithetic draws make `{η_r} = {-η_r}` as a set.
+
+# Lognormal coefficients
+With `:lognormal` the coefficient is `β_im = exp(μ_m + σ_m·η_im) > 0`, and with
+`:neg_lognormal` it is `-exp(μ_m + σ_m·η_im) < 0`. Use these when a coefficient
+is sign-constrained on economic grounds and a normal random coefficient with a
+large `σ` would put an implausible share of the population on the wrong side of
+zero.
+
+**`μ_m` and `σ_m` are then the mean and standard deviation of `log|β_im|`, not of
+`β_im`.** `theta_names` is unchanged (`x` and `sd_x`), so `theta_hat` alone does
+not tell you which scale a row is on — read `extra.rfx` for that, or use
+[`rfx_level_moments`](@ref) / `boot_report`, which report both scales explicitly.
+The level moments are
+
+    E[β_im]  = ±exp(μ_m + σ_m²/2)
+    median   = ±exp(μ_m)
+    SD[β_im] =  exp(μ_m + σ_m²/2)·sqrt(exp(σ_m²) - 1)
+
+`regtable_rfx` prints these level moments for a lognormal row, so that a table
+mixing normal and lognormal specifications is comparable row by row.
 
 `fit.extra` carries `n_groups`, `K`, `M`, `R`, `col_id`, `rfx`, `seed`, the ESS
 diagnostic (`ess_min`, `ess_p10`, `ess_median`, `ess_mean`) and the panel shape
