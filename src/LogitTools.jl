@@ -24,7 +24,7 @@ export mlogit, boot_mlogit,
        regtable
 
 export logit2_rfx, boot_logit2_rfx, theta0_rfx, boot_report, boot_vcov!, regtable_rfx,
-       rfx_level_moments
+       rfx_level_moments, theta0_rfx_multistart
 
 include("MLE_objects.jl")
 

@@ -41,8 +41,15 @@ coefficient group) level.
 - `cluster_var = nothing`: if given, must equal `col_id`.
 - `parallel = true`: distribute replicates over `workers()`. Requires
   `addprocs(n)` and `@everywhere using LogitTools`.
-- `theta_start = nothing`: warm start; defaults to `theta0`. Passing the main
-  fit's `theta_hat` is usually much faster.
+- `theta_start = nothing`: warm start; defaults to `theta0`. Passing the main fit's
+  `theta_hat` is usually much faster. May also be an `nstarts × npar` **matrix**, in
+  which case every replicate is itself multi-started and its best optimum is kept.
+  That costs `nstarts` times the runtime and is the right call when the specification
+  has local optima: a single warm start hands every replicate the same basin, so the
+  replicates inherit the point estimate's basin rather than exploring the one their own
+  resample prefers, and the resulting spread understates or distorts the sampling
+  variation. Keep this modest (4-8 starts) — it multiplies a run that is already
+  `nboot` fits.
 - `rethrow_errors = false`: by default a replicate that throws is captured as
   `errored` and the run continues. Set `true` to let the first exception
   propagate with its stacktrace. When replicates are failing, re-run with
@@ -97,8 +104,9 @@ function boot_logit2_rfx(
     P, gw_user = _prep_logit2_rfx(data_df, formula, choice, col_id, rfx,
                                   ndraws, seed, weights)
 
-    theta0 = _check_theta0_rfx(theta0, P)
-    th_start = isnothing(theta_start) ? theta0 : _check_theta0_rfx(theta_start, P)
+    theta0s  = _rfx_theta0_matrix(theta0, P)
+    th_start = isnothing(theta_start) ? theta0s : _rfx_theta0_matrix(theta_start, P)
+    nstart   = size(th_start, 1)
 
     # group-level Dirichlet weights
     W = _rfx_boot_weights(P.N, nboot, boot_seed)
@@ -108,8 +116,20 @@ function boot_logit2_rfx(
 
     # The closure captures P (design matrices + draws) and Wfull. CachingPool
     # serialises it once per worker; each task then transmits only an Int.
-    task = b -> _logit2_rfx(P, th_start, Vector{Float64}(view(Wfull, :, b)), optim_options;
-                            rethrow_errors = rethrow_errors)
+    # With several starts per replicate the inner fit must run SERIALLY: the outer pmap
+    # already owns every worker, and nesting would deadlock on the same pool. Each
+    # replicate then pays nstart fits, so the run is nstart times longer -- which is the
+    # price of not letting every replicate inherit one basin from a single warm start.
+    task = if nstart == 1
+        ths = vec(th_start)
+        b -> _logit2_rfx(P, ths, Vector{Float64}(view(Wfull, :, b)), optim_options;
+                         rethrow_errors = rethrow_errors)
+    else
+        b -> _logit2_rfx_multi(P, th_start, Vector{Float64}(view(Wfull, :, b)),
+                               optim_options; parallel = false,
+                               rethrow_errors = rethrow_errors,
+                               warn_multi = false)
+    end
 
     fits = if parallel
         pmap(task, CachingPool(workers()), 1:nboot)
@@ -538,7 +558,28 @@ values of the same size print as `>-0.01`.
 
 LaTeX needs `\$<\$`: a bare `<` in text mode renders as the wrong glyph.
 """
+# Above this magnitude a below-statistic is printed in scientific notation instead
+# of in full. A bootstrap standard error of 1.8e74 -- which is what the level mean of
+# a weakly identified lognormal coefficient produces -- is 75 characters at two
+# decimals and would wreck the column; "1.8e74" is four, and says the same thing.
+const _RFX_BIG = 1e5
+
+"""One significant digit in compact scientific notation: `1.8e74`, not `1.8e+74`."""
+function _rfx_sci(u)
+    s = Printf.format(Printf.Format("%.1e"), u)
+    s = replace(s, "e+0" => "e", "e-0" => "e-")
+    return replace(s, "e+" => "e")
+end
+
 function _rfx_fmt(render, u, digits, small_as_lt::Bool)
+    # Guard the two ways a below-statistic can be unprintable before anything else.
+    # These arise for real: a lognormal level moment is exp(mu + sigma^2/2), and
+    # replicates on the flat mu/sigma ridge send its bootstrap variance to something
+    # not representable. Printing "n.a." or "1.8e74" says "not estimable" without
+    # silently degrading the number or breaking the table.
+    isfinite(u) || return "n.a."
+    abs(u) >= _RFX_BIG && return _rfx_sci(u)
+
     s = Base.repr(render, u; digits, commas = false)
 
     # Decide from the rendered string, not from a reimplemented rounding rule:
@@ -587,18 +628,36 @@ struct RfxBelowStatistic
     tbl::IdDict{Any, NamedTuple}
     ci_for_sd::Bool
     small_as_lt::Bool
+    mean_stat::Symbol      # :se or :ci, for a lognormal E[β] row
 end
-RfxBelowStatistic(tbl, ci_for_sd) = RfxBelowStatistic(tbl, ci_for_sd, true)
+RfxBelowStatistic(tbl, ci_for_sd) = RfxBelowStatistic(tbl, ci_for_sd, true, :se)
+RfxBelowStatistic(tbl, ci_for_sd, small_as_lt) =
+    RfxBelowStatistic(tbl, ci_for_sd, small_as_lt, :se)
 
 function (f::RfxBelowStatistic)(rr, k::Int; vargs...)
     d = f.tbl[rr]
-    # Lognormal level rows get the interval for the same reason the sigma rows do,
-    # and then some: E[b] and SD[b] are exp() transforms, so a replicate that lands
-    # in the flat mu/sigma ridge (large sigma, compensating mu) maps to an enormous
-    # level moment and the bootstrap variance is not usefully finite. Percentiles
-    # are unaffected by a handful of such draws; a standard error is destroyed by
-    # them. See _rfx_boot_se.
-    use_ci = f.ci_for_sd && (d.is_sd[k] || d.is_log_row[k])
+
+    # Three cases, and only the middle one is a judgement call.
+    #
+    #   sigma / SD rows      -> interval when ci_for_sd: sign unidentified, abs()
+    #                           canonicalised, sigma = 0 on the boundary.
+    #   lognormal E[b] rows  -> standard error by default (mean_stat = :se), so the
+    #                           row matches the beta rows of the normal columns it
+    #                           sits beside. E[b] is a mean with an identified sign,
+    #                           which is the textbook case for a standard error; the
+    #                           cost is that the bootstrap variance of exp(mu +
+    #                           sigma^2/2) is fragile when sigma is loosely pinned,
+    #                           and such an SE prints in scientific notation rather
+    #                           than being quietly replaced. mean_stat = :ci opts out.
+    #   everything else      -> standard error, exactly as before.
+    use_ci = if d.is_sd[k]
+        f.ci_for_sd
+    elseif d.is_log_row[k]
+        f.mean_stat === :ci
+    else
+        false
+    end
+
     return use_ci ?
         RfxUnderStat((d.ci_lo[k], d.ci_hi[k]), f.small_as_lt) :
         RfxUnderStat(d.se[k], f.small_as_lt)
@@ -676,9 +735,12 @@ function _rfx_table_stats(fit::MLEFit, ci_levels)
                   "$(nbad[j]) of $(size(kept, 1)) bootstrap replicates (first affected " *
                   "row: $(isnothing(fit.theta_names) ? j : fit.theta_names[j])). Those " *
                   "replicates sit in the flat μ/σ ridge, where exp(μ + σ²/2) is not " *
-                  "representable. The percentile interval is unaffected and is what " *
-                  "ci_for_sd = true reports; the standard error for that row is not " *
-                  "usefully finite and should not be quoted."
+                  "representable, so that row's bootstrap standard error is not " *
+                  "usefully finite -- it will print in scientific notation, which is " *
+                  "the table saying the second moment does not exist rather than " *
+                  "reporting a precision. The percentile interval is unaffected: see " *
+                  "rfx_level_moments, or pass lognormal_mean_stat = :ci to put the " *
+                  "interval in the table instead."
         end
         s
     end
@@ -714,13 +776,20 @@ end
    level moments, including the median, is in [`rfx_level_moments`](@ref), and
    `boot_report` carries both scales.
 
-   The two level rows carry a **percentile interval**, not a standard error, even
-   though `E[β]` is a mean. `E[β]` and `SD[β]` are `exp()` transforms of `(μ, σ)`, and
-   the simulated likelihood has a flat ridge along which a large `σ` is offset by a
-   very negative `μ`; a replicate converging there maps to a level moment of `1e14`
-   or to `Inf`, which destroys the bootstrap standard error while leaving the
-   percentiles untouched. `ci_for_sd = false` gives standard errors throughout, and
-   warns when any replicate overflowed.
+   The `E[β]` row carries a **standard error** in parentheses, like the `β` rows of
+   the normal columns it sits beside: `E[β]` is a mean with an identified sign, which
+   is the textbook case for a standard error. The `SD[β]` row keeps the **percentile
+   interval** in square brackets, as the `σ` rows do.
+
+   Be aware of what that costs. `E[β] = exp(μ + σ²/2)` and the simulated likelihood
+   has a flat ridge along which a large `σ` is offset by a very negative `μ`; a
+   replicate converging there maps to a level mean of `1e14` or to `Inf`, and the
+   bootstrap variance stops being usefully finite while the percentiles stay put. Such
+   a standard error prints in compact scientific notation (`1.8e74`) or as `n.a.`,
+   never as a plausible-looking number, and a warning names the row. That is the table
+   reporting that the second moment does not exist, not a precision. Pass
+   `lognormal_mean_stat = :ci` to put the percentile interval on that row instead, or
+   read `rfx_level_moments`, which always carries both.
 
    Such a fit needs bootstrap replicates and RegressionTables 0.7+, and by default
    carries no significance stars on either of its two main rows — `E[β]` and `SD[β]`
@@ -782,9 +851,12 @@ function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
                       ci_levels = [2.5, 97.5], stars_for_sd::Bool = false,
                       stars_for_lognormal::Bool = false,
                       log_params::Bool = true,
+                      lognormal_mean_stat::Symbol = :se,
                       small_as_lt::Bool = true, kwargs...)
 
     isempty(fits) && error("regtable_rfx needs at least one MLEFit")
+    lognormal_mean_stat in (:se, :ci) || error(
+        "lognormal_mean_stat must be :se or :ci, got :$lognormal_mean_stat")
 
     # Stats first, then the rendering path, then the models. The order matters:
     # star suppression writes a huge variance onto the vcov diagonal, and that is
@@ -893,7 +965,8 @@ function regtable_rfx(fits::MLEFit...; ci_for_sd::Bool = true,
     return RegressionTables.regtable(models...;
                                      render = AsciiTable(),
                                      below_statistic = RfxBelowStatistic(stats, ci_for_sd,
-                                                                         small_as_lt),
+                                                                         small_as_lt,
+                                                                         lognormal_mean_stat),
                                      kw...)
 end
 

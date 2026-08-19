@@ -735,7 +735,9 @@ too easy to transpose silently.
 - `formula`: `Vector{Symbol}` of regressors, as in `logit2`.
 - `choice`: the 0/1 outcome column.
 - `col_id`: group (individual) identifier for the random coefficients.
-- `theta0`: starting values, length `K + M`. See [`theta0_rfx`](@ref).
+- `theta0`: starting values. Either a vector of length `K + M` (see [`theta0_rfx`](@ref))
+  for a single start, or an `nstarts × (K + M)` matrix — one start per **row** — for a
+  multi-start fit. See "Multi-start" below and [`theta0_rfx_multistart`](@ref).
 
 # Keywords
 - `rfx = Symbol[]`: subset of `formula` carrying random coefficients. A bare
@@ -747,6 +749,8 @@ too easy to transpose silently.
   function evaluation, so the objective is a deterministic function of θ.
 - `weights = nothing`: column name; must be constant within `col_id`.
 - `optim_options = Optim.Options()`.
+- `parallel = false`: distribute a **multi-start** fit over `workers()`. Ignored for a
+  single start. Requires `addprocs(n)` and `@everywhere using LogitTools`.
 - `rethrow_errors = false`: by default a failed optimisation is captured into
   `errored`/`error_message`. Set `true` to let the exception propagate instead,
   which is what you want when debugging a fit that will not run.
@@ -784,10 +788,34 @@ mixing normal and lognormal specifications is comparable row by row.
 diagnostic (`ess_min`, `ess_p10`, `ess_median`, `ess_mean`) and the panel shape
 (`Ti_min`, `Ti_median`, `Ti_max`).
 
+# Multi-start
+Pass an `nstarts × (K + M)` matrix as `theta0` and every row is fitted; the best
+usable optimum is returned, with one row per attempt in `fit.fits_df` and a summary in
+`fit.extra` (`n_starts`, `n_usable_starts`, `n_distinct_optima`, `n_at_best`,
+`obj_best`, `obj_second`, `obj_worst`).
+
+**This is not optional diligence for the lognormal families.** A single fit's
+`converged = true` says an optimum was reached, not that it was the maximum, and the
+simulated likelihood of a lognormal specification can have well-separated local optima
+whenever two `σ`'s trade off. Measured on Table 2 of the urban-exposure data
+(`rfx = [:any_fam, :salient, :tfx]`, all lognormal, `ndraws = 200`): 5 of 11 starts —
+including the `s0 = 0.5` default — landed 3.29 log-likelihood units below the maximum,
+at `σ_log = [0.62, 0.91, 0.93]` instead of `[0.63, 1.54, 0.15]`. The same specification
+with normal coefficients reached one optimum from all 11 starts, so the risk is
+specific to the parameterisation, not to the data.
+
+A multi-start fit warns when the starts reach more than one distinct optimum, and
+reports what share of them found the best.
+
 # Example
 ```julia
 theta0 = theta0_rfx(myxs, [:dur, :dist]; b0 = logit_fit.theta_hat)
 fit = logit2_rfx(df, myxs, :pick1, :personid, theta0; rfx = [:dur, :dist])
+
+# multi-start, in parallel, then bootstrap from the winner
+th0 = theta0_rfx_multistart(myxs, myrfx; b0 = logit_fit.theta_hat, nstarts = 400)
+fit = logit2_rfx(df, myxs, :pick1, :personid, th0; rfx = myrfx, parallel = true)
+fit.extra.n_distinct_optima
 ```
 """
 function logit2_rfx(
@@ -801,14 +829,21 @@ function logit2_rfx(
         seed::Int = 20260808,
         weights::Union{Nothing, Symbol, String} = nothing,
         optim_options::Optim.Options = Optim.Options(),
+        parallel::Bool = false,
         rethrow_errors::Bool = false)
 
     P, gw = _prep_logit2_rfx(data_df, formula, choice, col_id, rfx,
                              ndraws, seed, weights)
 
-    theta0 = _check_theta0_rfx(theta0, P)
+    theta0s = _rfx_theta0_matrix(theta0, P)
 
-    myfit = _logit2_rfx(P, theta0, gw, optim_options; rethrow_errors = rethrow_errors)
+    myfit = if size(theta0s, 1) == 1
+        _logit2_rfx(P, vec(theta0s), gw, optim_options; rethrow_errors = rethrow_errors)
+    else
+        parallel && _check_boot_workers()
+        _logit2_rfx_multi(P, theta0s, gw, optim_options;
+                          parallel = parallel, rethrow_errors = rethrow_errors)
+    end
 
     if !myfit.errored && P.M > 0 && myfit.extra.ess_p10 < 30
         @warn "10th-percentile effective number of draws is " *
@@ -818,6 +853,194 @@ function logit2_rfx(
     end
 
     return myfit
+end
+
+"""
+    theta0_rfx_multistart(formula, rfx; b0, nstarts, s_range, b_jitter, seed) -> Matrix
+
+An `nstarts × (K + M)` matrix of starting values for [`logit2_rfx`](@ref), **one start
+per row**.
+
+Row 1 is exactly `theta0_rfx(formula, rfx; b0 = b0)`, so the single-start default is
+always among the candidates and a multi-start run can never return a worse optimum
+than the corresponding single-start run.
+
+Rows 2 onward draw each `σ_m` **log-uniformly** over `s_range`. Log-uniform rather than
+uniform because `σ` is a scale parameter and the basins are spread over orders of
+magnitude: a uniform draw on `(0.05, 2)` puts 95% of its mass above 0.15 and would
+barely explore the near-homogeneous region where a weakly identified `σ` actually
+lives.
+
+`b_jitter > 0` additionally multiplies each `b0_k` by `exp(b_jitter · z)`, `z ~ N(0,1)`.
+Multiplicative, so the sign survives — which a lognormal coefficient requires.
+
+`b0` is on the **level** scale throughout, as in [`theta0_rfx`](@ref); the conversion
+to `μ` for the lognormal entries is done per row, with that row's `σ`.
+
+# Example
+```julia
+th0 = theta0_rfx_multistart(myxs, myrfx; b0 = plain.theta_hat, nstarts = 400)
+fit = logit2_rfx(df, myxs, :pick1, :personid, th0; rfx = myrfx, parallel = true)
+fit.fits_df       # one row per start
+```
+"""
+function theta0_rfx_multistart(formula, rfx;
+                               b0 = zeros(length(formula)),
+                               nstarts::Int = 100,
+                               s_range = (0.05, 2.0),
+                               b_jitter::Real = 0.0,
+                               seed::Int = 20260808)
+
+    nstarts >= 1 || error("nstarts must be at least 1; got $nstarts")
+    lo, hi = float(s_range[1]), float(s_range[2])
+    (0 < lo && lo <= hi) || error(
+        "s_range must satisfy 0 < first <= last; got $s_range")
+    b_jitter >= 0 || error("b_jitter must be >= 0; got $b_jitter")
+
+    K, M = length(formula), length(rfx)
+    rng  = MersenneTwister(seed)
+
+    out = Matrix{Float64}(undef, nstarts, K + M)
+    out[1, :] .= theta0_rfx(formula, rfx; b0 = b0)
+
+    for r in 2:nstarts
+        s = exp.(log(lo) .+ (log(hi) - log(lo)) .* rand(rng, M))
+        b = b_jitter > 0 ? collect(Float64, b0) .* exp.(b_jitter .* randn(rng, K)) : b0
+        out[r, :] .= theta0_rfx(formula, rfx; b0 = b, s0 = s)
+    end
+
+    return out
+end
+
+"""
+    _rfx_theta0_matrix(theta0, P) -> Matrix{Float64}
+
+Normalise `theta0` to an `nstarts × npar` matrix and validate every row. Accepts a
+plain vector (one start), a matrix with `npar` columns, or a vector of vectors.
+"""
+function _rfx_theta0_matrix(theta0, P::RfxPrep)
+    npar = P.K + P.M
+
+    if theta0 isa AbstractMatrix
+        size(theta0, 2) == npar || error(
+            "theta0 has $(size(theta0, 2)) columns but the model has K + M = $npar " *
+            "parameters. Multi-start theta0 is nstarts × npar: one start per ROW. " *
+            "Build it with theta0_rfx_multistart.")
+        out = Matrix{Float64}(undef, size(theta0, 1), npar)
+        for r in axes(theta0, 1)
+            out[r, :] .= _check_theta0_rfx(collect(view(theta0, r, :)), P)
+        end
+        return out
+    end
+
+    if theta0 isa AbstractVector && !isempty(theta0) && first(theta0) isa AbstractVector
+        out = Matrix{Float64}(undef, length(theta0), npar)
+        for (r, t) in enumerate(theta0)
+            out[r, :] .= _check_theta0_rfx(collect(t), P)
+        end
+        return out
+    end
+
+    return reshape(_check_theta0_rfx(theta0, P), 1, npar)
+end
+
+"""
+    _logit2_rfx_multi(P, theta0s, gw, optim_options; parallel, rethrow_errors) -> MLEFit
+
+Fit from every row of `theta0s` and return the best usable fit, carrying the full set
+of attempts in `fits_df`.
+
+"Best" is the lowest `obj_value` among fits that neither errored nor failed to
+converge. A non-converged fit is never selected even when its objective is lower: a
+smaller value at a point the optimiser was still moving through is not an optimum.
+
+Warns when the starts reach more than one distinct optimum, because that is the case
+in which a single-start fit is a coin flip — and it is invisible from a single fit,
+whose `converged = true` says only that *an* optimum was reached.
+"""
+function _logit2_rfx_multi(P::RfxPrep, theta0s::AbstractMatrix{Float64},
+                           gw::Union{Nothing, Vector{Float64}},
+                           optim_options::Optim.Options = Optim.Options();
+                           parallel::Bool = false,
+                           rethrow_errors::Bool = false,
+                           warn_multi::Bool = true,
+                           obj_tol::Float64 = 1e-4)
+
+    nstarts = size(theta0s, 1)
+
+    task = r -> _logit2_rfx(P, Vector{Float64}(view(theta0s, r, :)), gw, optim_options;
+                            rethrow_errors = rethrow_errors)
+
+    fits = parallel ? pmap(task, CachingPool(workers()), 1:nstarts) : map(task, 1:nstarts)
+
+    objs = [f.obj_value for f in fits]
+    ok   = [(!f.errored) && f.converged for f in fits]
+    cand = findall(ok)
+
+    if isempty(cand)
+        nerr = count(f -> f.errored, fits)
+        msg = "none of the $nstarts starts produced a usable fit " *
+              "($nerr errored, $(nstarts - nerr) ran but did not converge)."
+        if nerr > 0
+            msg *= "\nFirst error was:\n    " *
+                   replace(fits[findfirst(f -> f.errored, fits)].error_message,
+                           "\n" => "\n    ")
+        end
+        rethrow_errors && error(msg)
+
+        # Return a failed fit rather than throwing, so that one hopeless bootstrap
+        # replicate is filtered out by _assemble_rfx_boot instead of taking down a
+        # 500-replicate run. Same contract as _logit2_rfx.
+        bad = fits[something(findfirst(f -> f.errored, fits), 1)]
+        bad.errored = true
+        bad.error_message = msg
+        return bad
+    end
+
+    ibest = cand[argmin(objs[cand])]
+    best  = fits[ibest]
+
+    # Distinct optima: greedy clustering of the usable objectives, comparing each to the
+    # current cluster's representative rather than to its neighbour, so a long chain of
+    # closely spaced values does not merge two genuinely separated optima.
+    reps = Float64[]
+    for q in sort(objs[cand])
+        (isempty(reps) || q - reps[end] > obj_tol) && push!(reps, q)
+    end
+    ndistinct = length(reps)
+    nbest = count(q -> q - reps[1] <= obj_tol, objs[cand])
+
+    best.fits_df = DataFrame(
+        start      = 1:nstarts,
+        obj_value  = objs,
+        converged  = [f.converged for f in fits],
+        errored    = [f.errored   for f in fits],
+        iterations = [f.iterations for f in fits],
+        is_best    = (1:nstarts) .== ibest,
+        theta0     = [Vector{Float64}(view(theta0s, r, :)) for r in 1:nstarts],
+        theta_hat  = [copy(f.theta_hat) for f in fits],
+    )
+
+    best.extra = merge(best.extra, (;
+        n_starts          = nstarts,
+        n_usable_starts   = length(cand),
+        n_distinct_optima = ndistinct,
+        n_at_best         = nbest,
+        obj_best          = reps[1],
+        obj_worst         = reps[end],
+        obj_second        = ndistinct > 1 ? reps[2] : NaN))
+
+    if warn_multi && ndistinct > 1
+        @warn "multi-start found $ndistinct distinct optima across $nstarts starts: " *
+              "the best objective is $(round(reps[1], digits = 4)) and the worst is " *
+              "$(round(reps[end], digits = 4)) (gap $(round(reps[end] - reps[1], digits = 4))). " *
+              "Only $nbest of $(length(cand)) usable starts reached the best one, so a " *
+              "single-start fit had a $(round(100 * (1 - nbest / length(cand)), digits = 1))% " *
+              "chance of returning a non-maximum. The best fit is returned; see fits_df " *
+              "for all attempts."
+    end
+
+    return best
 end
 
 """Validate `theta0` against a prepped model."""

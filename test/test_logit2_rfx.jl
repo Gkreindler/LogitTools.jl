@@ -367,9 +367,12 @@ end
             @test LT._rfx_fmt(asc, 0.003,  2, true) == "<0.005"
             @test LT._rfx_fmt(asc, 0.12,   2, true) == "0.12"
 
-            # an exact zero stays an exact zero, and NaN is untouched
+            # an exact zero stays an exact zero; NaN is never mistaken for a small
+            # number, and renders as the table convention rather than as jargon that
+            # reads like a crash
             @test LT._rfx_fmt(asc, 0.0, 2, true) == "0.00"
-            @test LT._rfx_fmt(asc, NaN, 2, true) == "NaN"
+            @test LT._rfx_fmt(asc, NaN, 2, true) == "n.a."
+            @test LT._rfx_fmt(lat, NaN, 2, true) == "n.a."
 
             # negatives of the same size
             @test LT._rfx_fmt(asc, -0.003, 2, true) == ">-0.005"
@@ -987,8 +990,191 @@ end
 
                 # the table still renders and warns rather than printing a bare NaN
                 dbad = (@test_logs (:warn, r"overflow") LT._rfx_table_stats(fbad, [5.0, 90.0]))
-                @test all(isfinite, dbad.se)
                 @test all(isfinite, dbad.ci_lo) && all(isfinite, dbad.ci_hi)
+
+                # An unrepresentable standard error must be unmistakable in the cell,
+                # never a plausible-looking number and never 75 characters wide.
+                @test LT._rfx_fmt(AsciiTable(), 1.7696e74, 2, true) == "1.8e74"
+                @test LT._rfx_fmt(AsciiTable(), -1.8e74,   2, true) == "-1.8e74"
+                @test LT._rfx_fmt(AsciiTable(), Inf,       2, true) == "n.a."
+                @test LT._rfx_fmt(AsciiTable(), NaN,       2, true) == "n.a."
+                @test LT._rfx_fmt(AsciiTable(), 2347.4835, 2, true) == "2347.48"
+                @test LT._rfx_fmt(AsciiTable(), 0.1234,    2, true) == "0.12"
+                @test LT._rfx_fmt(AsciiTable(), 0.0001,    2, true) == "<0.005"
+                @test length(Base.repr(AsciiTable(), LT.RfxUnderStat(1.7696e74);
+                                       digits = 2)) < 12
+            end
+
+            # ---- E[beta] takes a standard error, SD[beta] an interval -------
+            @testset "lognormal_mean_stat" begin
+                mdl  = LT.LogitRegModel(fit)
+                tmap = IdDict{Any, NamedTuple}(mdl => d)
+                bs_se = LT.RfxBelowStatistic(tmap, true, true, :se)
+                bs_ci = LT.RfxBelowStatistic(tmap, true, true, :ci)
+
+                # default :se -- the E[b] row (k = 1) gets a scalar, i.e. parentheses
+                @test bs_se(mdl, 1).val isa Float64
+                @test bs_se(mdl, 1).val == d.se[1]
+                # the SD[b] row (k = 4) keeps the interval either way
+                @test bs_se(mdl, 4).val isa Tuple
+                @test bs_ci(mdl, 4).val isa Tuple
+                # ordinary beta rows are unchanged
+                @test bs_se(mdl, 2).val == d.se[2]
+                @test bs_ci(mdl, 2).val == d.se[2]
+                # :ci opts the E[b] row into the interval
+                @test bs_ci(mdl, 1).val isa Tuple
+                # the three-argument constructor still defaults to :se
+                @test LT.RfxBelowStatistic(tmap, true, true).mean_stat === :se
+                @test LT.RfxBelowStatistic(tmap, true).mean_stat === :se
+
+                tab_se = sprint(show, regtable_rfx(fit; digits = 2, digits_stats = 2))
+                tab_ci = sprint(show, regtable_rfx(fit; digits = 2, digits_stats = 2,
+                                                  lognormal_mean_stat = :ci))
+                @test tab_se != tab_ci
+                # the E[b] cell is "(se)" under :se and an interval under :ci
+                @test occursin("(" * LT._rfx_num(d.se[1], 2) * ")", tab_se)
+                @test !occursin("(" * LT._rfx_num(d.se[1], 2) * ")", tab_ci)
+                # SD[b] keeps its interval in both
+                @test occursin("[", tab_se) && occursin("[", tab_ci)
+
+                @test_throws ErrorException regtable_rfx(fit; lognormal_mean_stat = :nope)
+            end
+        end
+
+        # -------------------------------------------------------------------
+        @testset "multi-start" begin
+            myxs  = [:x1, :x2, :x3]
+            myrfx = [:x1 => :lognormal, :x3 => :normal]
+            df2   = _rfx_testdata(N = 80, T = 6, K = 3, seed = 31,
+                                  beta = [0.7, -0.6, 0.4])
+            plain = logit2(copy(df2), myxs, :pick1, zeros(3))
+
+            @testset "theta0_rfx_multistart" begin
+                th0 = theta0_rfx_multistart(myxs, myrfx; b0 = plain.theta_hat,
+                                            nstarts = 40, s_range = (0.05, 2.0), seed = 5)
+                @test size(th0) == (40, 5)
+                # row 1 IS the single-start default, so multi-start can never lose to it
+                @test th0[1, :] == theta0_rfx(myxs, myrfx; b0 = plain.theta_hat)
+                # sigma columns respect the range; mu columns vary with sigma because the
+                # lognormal conversion subtracts s0^2/2
+                @test all(0.05 .<= th0[:, 4] .<= 2.0)
+                @test all(0.05 .<= th0[:, 5] .<= 2.0)
+                @test length(unique(th0[:, 4])) > 30
+                # log-uniform, not uniform: the median sigma sits near the geometric mean
+                # sqrt(0.05*2) = 0.316, well below the arithmetic midpoint 1.025
+                @test median(th0[2:end, 5]) < 0.6
+                # b0 is untouched for a non-rfx coefficient unless jittered
+                @test all(th0[:, 2] .== plain.theta_hat[2])
+                thj = theta0_rfx_multistart(myxs, myrfx; b0 = plain.theta_hat,
+                                            nstarts = 20, b_jitter = 0.3, seed = 5)
+                @test length(unique(thj[:, 2])) > 15
+                # Jitter is multiplicative, so the sign of every LEVEL coefficient
+                # survives -- which is what lets a lognormal entry be jittered at all.
+                # Checked on x2 (b0 < 0, not an rfx variable, so it stays on the level
+                # scale); column 1 is mu = log(b0) - s0^2/2 for the lognormal x1, whose
+                # sign carries no information about b0's.
+                @test plain.theta_hat[2] < 0
+                @test all(thj[:, 2] .< 0)
+                @test all(thj[:, 3] .> 0) == (plain.theta_hat[3] > 0)
+                # the lognormal entry stays on the positive support it requires
+                @test all(exp.(thj[:, 1] .+ thj[:, 4].^2 ./ 2) .> 0)
+                @test_throws ErrorException theta0_rfx_multistart(myxs, myrfx; nstarts = 0)
+                @test_throws ErrorException theta0_rfx_multistart(myxs, myrfx;
+                                                b0 = plain.theta_hat, s_range = (0.0, 1.0))
+                @test_throws ErrorException theta0_rfx_multistart(myxs, myrfx;
+                                                b0 = plain.theta_hat, s_range = (2.0, 1.0))
+            end
+
+            @testset "matrix theta0 selects the best optimum" begin
+                th0 = theta0_rfx_multistart(myxs, myrfx; b0 = plain.theta_hat,
+                                            nstarts = 12, seed = 8)
+                f = logit2_rfx(df2, myxs, :pick1, :personid, th0;
+                               rfx = myrfx, ndraws = 100, seed = 3)
+                @test f.converged && !f.errored
+                @test !isnothing(f.fits_df)
+                @test nrow(f.fits_df) == 12
+                @test count(f.fits_df.is_best) == 1
+                @test f.extra.n_starts == 12
+                @test f.extra.n_usable_starts <= 12
+                @test f.extra.obj_best <= f.extra.obj_worst
+                # the returned fit IS the best usable one
+                usable = f.fits_df[f.fits_df.converged .& .!f.fits_df.errored, :]
+                @test f.obj_value ≈ minimum(usable.obj_value)
+                @test f.obj_value ≈ f.extra.obj_best
+                @test f.theta0 == th0[findfirst(f.fits_df.is_best), :]
+                # never worse than the single-start default, which is row 1
+                f1 = logit2_rfx(df2, myxs, :pick1, :personid, th0[1, :];
+                                rfx = myrfx, ndraws = 100, seed = 3)
+                @test f.obj_value <= f1.obj_value + 1e-8
+                # a vector of vectors is accepted too
+                fv = logit2_rfx(df2, myxs, :pick1, :personid,
+                                [th0[r, :] for r in 1:4];
+                                rfx = myrfx, ndraws = 100, seed = 3)
+                @test nrow(fv.fits_df) == 4
+            end
+
+            @testset "single start is unchanged" begin
+                th1 = theta0_rfx(myxs, myrfx; b0 = plain.theta_hat)
+                f = logit2_rfx(df2, myxs, :pick1, :personid, th1;
+                               rfx = myrfx, ndraws = 100, seed = 3)
+                @test isnothing(f.fits_df)                 # no multi-start bookkeeping
+                @test !hasproperty(f.extra, :n_starts)
+                # a 1-row matrix takes the same path
+                f1 = logit2_rfx(df2, myxs, :pick1, :personid, reshape(th1, 1, :);
+                                rfx = myrfx, ndraws = 100, seed = 3)
+                @test f1.theta_hat == f.theta_hat
+                @test isnothing(f1.fits_df)
+            end
+
+            @testset "guards and warnings" begin
+                th1 = theta0_rfx(myxs, myrfx; b0 = plain.theta_hat)
+                # wrong number of COLUMNS: starts are rows, so a transposed matrix fails
+                @test_throws ErrorException logit2_rfx(df2, myxs, :pick1, :personid,
+                                    permutedims(reshape(th1, 1, :)); rfx = myrfx)
+                # every row is validated, so a sigma = 0 row is caught
+                bad = [reshape(th1, 1, :); reshape([th1[1:3]; 0.0; 0.5], 1, :)]
+                @test_throws ErrorException logit2_rfx(df2, myxs, :pick1, :personid, bad;
+                                                       rfx = myrfx)
+
+                # two genuinely separated optima -> warns, and picks the better
+                P, buf, gw = _ln_setup([:x1 => :lognormal]; K = 4)
+                th = [0.2, -0.3, 0.1, 0.4, 0.7]
+                good = LT._logit2_rfx(P, th, gw, Optim.Options())
+                # a start that cannot move (huge mu) errors; mixing it in must not throw
+                mixed = [reshape(th, 1, :); reshape([800.0, 0.0, 0.0, 0.0, 0.5], 1, :)]
+                fm = LT._logit2_rfx_multi(P, mixed, gw, Optim.Options())
+                @test !fm.errored
+                @test fm.obj_value ≈ good.obj_value
+                @test fm.fits_df.errored == [false, true]
+                @test fm.extra.n_usable_starts == 1
+
+                # if NOTHING is usable the failure is captured, not thrown, so one bad
+                # bootstrap replicate cannot kill a 500-replicate run
+                allbad = [reshape([800.0, 0.0, 0.0, 0.0, 0.5], 1, :);
+                          reshape([900.0, 0.0, 0.0, 0.0, 0.6], 1, :)]
+                fb = LT._logit2_rfx_multi(P, allbad, gw, Optim.Options())
+                @test fb.errored
+                @test occursin("none of the 2 starts", fb.error_message)
+                @test_throws ErrorException LT._logit2_rfx_multi(P, allbad, gw,
+                                                Optim.Options(); rethrow_errors = true)
+            end
+
+            @testset "bootstrap accepts a matrix theta_start" begin
+                th0 = theta0_rfx_multistart(myxs, myrfx; b0 = plain.theta_hat,
+                                            nstarts = 3, seed = 12)
+                f = logit2_rfx(df2, myxs, :pick1, :personid, th0;
+                               rfx = myrfx, ndraws = 100, seed = 3)
+                v = boot_logit2_rfx(df2, myxs, :pick1, :personid, th0;
+                                    rfx = myrfx, ndraws = 100, seed = 3, nboot = 6,
+                                    parallel = false, theta_start = th0)
+                @test size(v.theta_boot_table) == (6, 5)
+                @test all(f -> !isnothing(f.fits_df), v.boot_fits)   # each multi-started
+                @test all(f -> nrow(f.fits_df) == 3, v.boot_fits)
+                # and the single-start path still works
+                v1 = boot_logit2_rfx(df2, myxs, :pick1, :personid, th0;
+                                     rfx = myrfx, ndraws = 100, seed = 3, nboot = 6,
+                                     parallel = false, theta_start = f.theta_hat)
+                @test all(f -> isnothing(f.fits_df), v1.boot_fits)
             end
         end
 
