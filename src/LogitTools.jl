@@ -26,6 +26,9 @@ export mlogit, boot_mlogit,
 export logit2_rfx, boot_logit2_rfx, theta0_rfx, boot_report, boot_vcov!, regtable_rfx,
        rfx_level_moments, theta0_rfx_multistart
 
+export mlogit_rfx, boot_mlogit_rfx, theta0_mlogit_rfx, theta0_mlogit_rfx_multistart,
+       rfx_term, rfx_cell_report
+
 include("MLE_objects.jl")
 
 include("functions_mlogit_estimation.jl")
@@ -36,6 +39,12 @@ include("functions_logit2_inference.jl")
 
 include("functions_logit2_rfx_estimation.jl")
 include("functions_logit2_rfx_inference.jl")
+
+# after logit2_rfx: reuses its distribution helpers (_normalize_rfx internals,
+# _rfx_is_log, _rfx_sign) and its reporting layer (boot_report, regtable_rfx,
+# rfx_level_moments, _rfx_boot_weights, _assemble_rfx_boot)
+include("functions_mlogit_rfx_estimation.jl")
+include("functions_mlogit_rfx_inference.jl")
 
 # include("optimization_backends.jl")
 # include("functions_inference.jl")

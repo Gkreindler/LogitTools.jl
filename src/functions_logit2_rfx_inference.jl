@@ -144,14 +144,21 @@ function boot_logit2_rfx(
 end
 
 """
-    _assemble_rfx_boot(fits, P, nboot) -> MLEvcov
+    _assemble_rfx_boot(fits, P::RfxPrep, nboot) -> MLEvcov
+    _assemble_rfx_boot(fits, npar::Int, nboot) -> MLEvcov
 
 Assemble the bootstrap replicates. Keeps every row of `theta_boot_table`; computes
 `V` on converged, non-errored rows only.
-"""
-function _assemble_rfx_boot(fits, P::RfxPrep, nboot::Int)
 
-    npar = P.K + P.M
+The `npar` method is the one that does the work; the `RfxPrep` method is kept so
+`boot_logit2_rfx` reads as it did. `boot_mlogit_rfx` uses the former, since the
+assembly logic depends on nothing but the parameter count.
+"""
+_assemble_rfx_boot(fits, P::RfxPrep, nboot::Int) =
+    _assemble_rfx_boot(fits, P.K + P.M, nboot)
+
+function _assemble_rfx_boot(fits, npar::Int, nboot::Int)
+
     theta_boot_table = Matrix{Float64}(undef, nboot, npar)
     for (b, f) in enumerate(fits)
         theta_boot_table[b, :] .= f.theta_hat
@@ -1064,12 +1071,19 @@ function boot_report(fit::MLEFit; ci_levels = [2.5, 97.5], sd_tol = 1e-3)
     is_sd = [j > K for j in 1:npar]
 
     # ---- header block ------------------------------------------------------
-    println("Bayesian bootstrap for logit2_rfx")
+    model = (!isnothing(e) && hasproperty(e, :model)) ? string(e.model) : "logit2_rfx"
+    println("Bayesian bootstrap for $model")
     println("  replicates : $nboot attempted / $used used / $(nboot - used) dropped")
     print("  n_obs      : $(fit.n_obs)")
     if !isnothing(e)
         println("   n_groups: $(e.n_groups)   (col_id = :$(e.col_id))")
         println("  T_i        : min $(e.Ti_min) / median $(e.Ti_median) / max $(e.Ti_max)")
+        # mlogit_rfx only: choice sets sit between the rows and the groups
+        if hasproperty(e, :n_sets)
+            println("  choice sets: $(e.n_sets)   (col_id = :$(e.col_set))   " *
+                    "per group: min $(e.sets_min) / median $(e.sets_median) / " *
+                    "max $(e.sets_max)")
+        end
         println("  draws      : R = $(e.R)  (seed $(e.seed))")
         @printf("  ESS        : min %.0f / p10 %.0f / median %.0f\n",
                 e.ess_min, e.ess_p10, e.ess_median)
@@ -1098,7 +1112,9 @@ function boot_report(fit::MLEFit; ci_levels = [2.5, 97.5], sd_tol = 1e-3)
     for (m, (v, d)) in enumerate(rfx_pairs)
         dist[K + m] = d
         _rfx_is_log(d) && (scale[K + m] = "log")
-        if !isnothing(rcols)
+        # rcols[m] == 0 for an mlogit_rfx random INTERCEPT: that term has no
+        # formula coefficient at all, so there is no beta row to annotate.
+        if !isnothing(rcols) && rcols[m] > 0
             dist[rcols[m]] = d
             _rfx_is_log(d) && (scale[rcols[m]] = "log")
         end

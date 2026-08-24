@@ -15,6 +15,7 @@ makedocs(
         "Home"                 => "index.md",
         "Binary logit"         => "logit2.md",
         "Random coefficients"  => "logit2_rfx.md",
+        "Option-level rfx"     => "mlogit_rfx.md",
         "API reference"        => "api.md",
     ],
     # Existing logit2/mlogit helpers are not all docstring'd yet; do not fail

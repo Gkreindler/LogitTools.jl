@@ -24,9 +24,16 @@ Modelled after [GMMTools.jl](https://github.com/Gkreindler/GMMTools.jl).
 | Binary logit | [`logit2`](@ref) | [`boot_logit2`](@ref) |
 | Multinomial logit | [`mlogit`](@ref) | [`boot_mlogit`](@ref) |
 | Binary logit, random coefficients | [`logit2_rfx`](@ref) | [`boot_logit2_rfx`](@ref) |
+| Multinomial logit, random coefficients | [`mlogit_rfx`](@ref) | [`boot_mlogit_rfx`](@ref) |
 
-All three return an `MLEFit`, so `vcov`, `cis` and `regtable` work the same way
+All four return an `MLEFit`, so `vcov`, `cis` and `regtable` work the same way
 across them.
+
+[`logit2_rfx`](@ref) puts every random coefficient on the panel unit — a taste the
+person carries into all of their choices. [`mlogit_rfx`](@ref) additionally lets a
+random effect live on the **option**: person `i`'s idiosyncratic taste for a
+particular alternative, shared across the choices in which `i` meets it. See
+[Option-level random effects](mlogit_rfx.md).
 
 ## Quick start
 
@@ -58,6 +65,7 @@ bootstrap and how to read the standard deviation parameters.
 - `examples/example.jl` — binary logit and its bootstrap
 - `examples/example_mlogit.jl` — multinomial logit
 - `examples/example_logit2_rfx.jl` — random coefficients end to end
+- `examples/example_mlogit_rfx.jl` — option-level random effects end to end
 
 ## Roadmap
 

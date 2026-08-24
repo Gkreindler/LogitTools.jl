@@ -11,6 +11,7 @@ RegressionTables.jl.
 | Binary logit | `logit2` | `boot_logit2` |
 | Multinomial logit | `mlogit` | `boot_mlogit` |
 | Binary logit with **random coefficients** | `logit2_rfx` | `boot_logit2_rfx` |
+| Multinomial logit with **random coefficients**, including **option-level** random effects | `mlogit_rfx` | `boot_mlogit_rfx` |
 
 All return an `MLEFit`, so `vcov`, `cis` and `regtable` work the same way across them.
 
