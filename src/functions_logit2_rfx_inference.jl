@@ -428,9 +428,9 @@ With `ci_for_sd = true` (the default) both rows carry a **percentile interval** 
 square brackets; with `ci_for_sd = false` both carry a bootstrap **standard error**
 in parentheses.
 
-For `sigma` the interval is right for the reason the level SD rows give: its sign is
-unidentified, the estimate is canonicalised with `abs()`, and `sigma = 0` sits on the
-boundary of the parameter space, so a symmetric interval is not calibrated.
+For `sigma` the interval is right for the reason the level SD rows give: it is
+constrained to be positive and `sigma = 0` sits on the boundary of the parameter
+space, so a symmetric interval is not calibrated.
 
 For `mu` the case is less automatic — its sign *is* identified and it is not near a
 boundary, so a standard error would be the textbook choice. The interval is the
@@ -646,8 +646,8 @@ function (f::RfxBelowStatistic)(rr, k::Int; vargs...)
 
     # Three cases, and only the middle one is a judgement call.
     #
-    #   sigma / SD rows      -> interval when ci_for_sd: sign unidentified, abs()
-    #                           canonicalised, sigma = 0 on the boundary.
+    #   sigma / SD rows      -> interval when ci_for_sd: sigma is constrained
+    #                           positive, with sigma = 0 on the boundary.
     #   lognormal E[b] rows  -> standard error by default (mean_stat = :se), so the
     #                           row matches the beta rows of the normal columns it
     #                           sits beside. E[b] is a mean with an identified sign,
@@ -811,14 +811,13 @@ end
    significance stars**.
 
 Points 2 and 3 are the statistically meaningful ones, and they have the same
-cause. Because `σ`'s sign is not identified, estimates are canonicalised with
-`abs()`, which folds the sampling distribution and makes it skewed — so a
-symmetric `±1.96·se` interval is the wrong summary for those rows, increasingly
-so the closer `σ` sits to zero. For the same reason a Wald test against zero is
-not calibrated there: `σ = 0` is on the boundary of the parameter space, where
-the LR statistic is a `½χ²₀ + ½χ²₁` mixture rather than `χ²₁`. Stars on those
-rows would invite exactly the reading they cannot support, so they are off by
-default; read the interval instead.
+cause. `σ` is constrained to be positive, so its sampling distribution is
+generally skewed near zero and a symmetric `±1.96·se` interval is the wrong
+summary for those rows. A Wald test against zero is not calibrated there either:
+`σ = 0` is on the boundary of the parameter space, where the LR statistic is a
+`½χ²₀ + ½χ²₁` mixture rather than `χ²₁`. Stars on those rows would invite exactly
+the reading they cannot support, so they are off by default; read the interval
+instead.
 
 Pass `ci_for_sd = false` for standard errors throughout,
 `stars_for_sd = true` to restore the conventional stars on the `sd_` rows, and
@@ -1037,11 +1036,10 @@ rather than a level — the estimated parameters, which is what
 so the CSV carries both scales and neither has to be reconstructed by hand.
 
 For the `σ` rows, **lead with the percentile CI rather than the standard error**.
-The `abs()` canonicalisation folds the sampling distribution, so it is skewed —
-increasingly so the closer `σ` sits to zero — and a symmetric `±1.96·se` interval
-is the wrong summary. `share_near_zero` (the share of converged replicates with
-`σ̂ₘ < sd_tol`) is the more informative statistic for whether homogeneity is
-rejected.
+Because `σ` is constrained to be positive, its sampling distribution is skewed
+near zero and a symmetric `±1.96·se` interval is the wrong summary.
+`share_near_zero` (the share of converged replicates with `σ̂ₘ < sd_tol`) is the
+more informative statistic for whether homogeneity is rejected.
 
 !!! note "Boundary problem"
     A confidence interval for a variance parameter that touches zero is a boundary

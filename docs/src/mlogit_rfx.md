@@ -142,8 +142,8 @@ applies harder:
 - **ESS alone is not enough.** Draws are held fixed across bootstrap replicates —
   they must be, or the objective is not a deterministic function of `θ` and LBFGS
   fails — so simulation error never enters `boot_se`.
-- Because `σ` is canonicalised with `abs()`, noise around a true zero always reads
-  as a *positive* number: too few draws bias a small `σ` **upward**.
+- Because `σ` is constrained positive, simulation noise around a true zero can
+  only read as a *positive* number: too few draws bias a small `σ` **upward**.
 - **The real test is refitting at other seeds** and at `2 × ndraws`, and comparing
   the spread in `σ̂` against `boot_se`. Monte Carlo error falls like `1/√R`; if the
   seed-to-seed spread does not fall, the parameter is weakly identified and more

@@ -67,13 +67,14 @@ not a minimum. The ``\sigma``-block of the gradient there is exactly zero, so an
 optimiser started at ``\sigma_0 = 0`` cannot move. [`theta0_rfx`](@ref) defaults
 to `0.5` and [`logit2_rfx`](@ref) rejects a zero start with an explicit error.
 
-### Why every returned `σ` is non-negative
+### Why every returned `σ` is positive
 
-The likelihood satisfies ``Q(\beta, \sigma) = Q(\beta, -\sigma)`` exactly, so
-there are ``2^M`` mirror optima and the sign of ``\sigma`` is not identified.
-Estimates are canonicalised with `abs()` at the source, in the main fit and in
-every bootstrap replicate alike. Without this, `cov(theta_boot_table)` would mix
-mirror modes and be meaningless.
+Each standard deviation is constrained positive during optimisation through an
+internal softplus transformation. This is more than a reporting convention. With
+finite antithetic draws, reversing all ``\sigma`` components together permutes the
+draws exactly, but reversing just one component generally changes the simulated
+objective slightly. Optimising in one positive orthant avoids those finite-draw
+sign artefacts and guarantees that `obj_value` is evaluated at `theta_hat`.
 
 ## Simulation draws
 
@@ -175,9 +176,9 @@ Bayesian bootstrap for logit2_rfx
    5 │ sd_dist     true   0.370021  0.0427818   0.288202   0.455247               0.0
 ```
 
-**For the `σ` rows, read the percentile CI, not the standard error.** The `abs()`
-canonicalisation folds the sampling distribution, so it is skewed — increasingly
-so the closer ``\sigma`` sits to zero — and a symmetric ``\pm 1.96 \cdot se``
+**For the `σ` rows, read the percentile CI, not the standard error.** Because
+standard deviations are constrained positive and zero is a boundary, the sampling
+distribution is skewed near zero and a symmetric ``\pm 1.96 \cdot se``
 interval is the wrong summary. A fit where `sd_x` came out at `0.015` with
 `boot_se` `0.200` would put most of that Wald interval below zero, while the
 percentile CI stays in the right place.

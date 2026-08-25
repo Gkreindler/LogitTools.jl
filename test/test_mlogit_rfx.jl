@@ -183,7 +183,9 @@ end
             b = P.any_log ? [-0.6, -0.3, 0.2] : [0.4, -0.3, 0.2]
             Qp = _mrfx_obj(P, buf, gw)(vcat(b, [ 0.7,  0.45]))
             Qm = _mrfx_obj(P, buf, gw)(vcat(b, [-0.7, -0.45]))
+            Qone = _mrfx_obj(P, buf, gw)(vcat(b, [-0.7, 0.45]))
             @test abs(Qp - Qm) < 1e-12 * max(1.0, abs(Qp))
+            @test abs(Qp - Qone) > 1e-8
         end
     end
 
@@ -486,6 +488,8 @@ end
                                 col_group = :uniqueid)[4:5] == [0.7, 0.2]
         @test_throws ErrorException theta0_mlogit_rfx(_RXS, rfx; b0 = [0.1, 0.2])
         @test_throws ErrorException theta0_mlogit_rfx(_RXS, rfx; s0 = [0.5])
+        @test_throws ErrorException theta0_mlogit_rfx(_RXS, rfx; s0 = [0.0, 0.5])
+        @test_throws ErrorException theta0_mlogit_rfx(_RXS, rfx; s0 = [-0.5, 0.5])
 
         # a lognormal start is converted from the level scale to the log scale
         s0 = 0.4
@@ -503,7 +507,7 @@ end
     end
 
     # -----------------------------------------------------------------------
-    @testset "determinism and canonical sigma" begin
+    @testset "determinism and positive sigma" begin
         df = _mrfx_testdata()
         rfx = [:x1, rfx_term(level = :alt)]
         th0 = vcat(zeros(3), [0.5, 0.5])
@@ -519,11 +523,17 @@ end
                        col_group = :uniqueid, rfx = rfx, ndraws = 64, seed = 99)
         @test c.theta_hat != a.theta_hat
 
-        # a negative-sigma start returns the canonical positive mode
-        d = mlogit_rfx(df, _RXS, :setid, :selected, vcat(zeros(3), [-0.5, -0.5]);
-                       col_group = :uniqueid, rfx = rfx, ndraws = 64)
-        @test all(d.theta_hat[4:5] .>= 0)
-        @test abs(d.obj_value - a.obj_value) < 1e-6
+        @test all(a.theta_hat[4:5] .> 0)
+        @test_throws ErrorException mlogit_rfx(
+            df, _RXS, :setid, :selected, vcat(zeros(3), [-0.5, 0.5]);
+            col_group = :uniqueid, rfx = rfx, ndraws = 64)
+
+        # Regression test for the old post-hoc abs() bug.
+        P, gw = LTR._prep_mlogit_rfx(
+            df, _RXS, :setid, :selected, :uniqueid, rfx, 64, 20260808, nothing)
+        qhat = LTR._mlogit_rfx_fg!(
+            true, nothing, a.theta_hat, P, LTR.MlogitRfxBuffers(P), gw)
+        @test a.obj_value ≈ qhat atol = 1e-9 rtol = 1e-12
     end
 
     # -----------------------------------------------------------------------
@@ -534,6 +544,7 @@ end
                          col_group = :uniqueid, rfx = rfx, ndraws = 64)
         e = fit.extra
         @test e.model == :mlogit_rfx
+        @test e.sigma_parameterization === :softplus
         @test e.K == 3 && e.M == 2 && e.R == 64
         @test e.col_id == :uniqueid            # the integration unit
         @test e.col_set == :setid               # the softmax group
@@ -578,8 +589,8 @@ end
         @test size(v.V) == (5, 5)
         @test v.method == :bayesian_bootstrap
         @test length(v.boot_fits) == 12
-        # every returned sigma is canonical
-        @test all(all(v.theta_boot_table[b, 4:5] .>= 0) for b in 1:12
+        # every returned sigma is positive
+        @test all(all(v.theta_boot_table[b, 4:5] .> 0) for b in 1:12
                   if all(isfinite, view(v.theta_boot_table, b, :)))
 
         # a fixed boot_seed is reproducible

@@ -124,8 +124,8 @@ using LogitTools
 # 5. Report
 #
 #    For the sigma rows, read the percentile CI rather than the standard error:
-#    the sign of sigma is not identified, so estimates are canonicalised with
-#    abs(), which folds the sampling distribution and makes it skewed.
+#    sigma is constrained positive and zero is a boundary, so the sampling
+#    distribution is skewed near zero.
 #    share_near_zero is the better statistic for whether homogeneity is rejected.
 # ============================================================================
 

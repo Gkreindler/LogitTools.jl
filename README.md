@@ -223,10 +223,10 @@ N               8,400
 
 ### Reading the `σ` rows
 
-**Lead with the percentile CI, not the standard error.** The sign of `σ` is not
-identified — the likelihood satisfies `Q(β, σ) = Q(β, -σ)` — so estimates are
-canonicalised to `σ ≥ 0`. That folds the sampling distribution and makes it
-skewed, increasingly so the closer `σ` sits to zero, and a symmetric `±1.96·se`
+**Lead with the percentile CI, not the standard error.** Standard deviations are
+constrained positive during optimisation, and `σ = 0` is a boundary of the
+parameter space. The sampling distribution is therefore skewed near zero, and a
+symmetric `±1.96·se`
 interval becomes the wrong summary. A `σ̂` of `0.015` with `boot_se` `0.200`
 would put most of its Wald interval below zero.
 

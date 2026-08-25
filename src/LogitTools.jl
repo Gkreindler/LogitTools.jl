@@ -19,6 +19,10 @@ using Random          # MersenneTwister
 using Statistics      # median, quantile
 using Distributed     # pmap, CachingPool, workers, nprocs, remotecall_fetch
 
+# Public implementation marker for downstream replication code that needs the
+# finite-draw-safe positive-sigma parameterisation introduced for the RFX fits.
+const RFX_SIGMA_PARAMETERIZATION = :softplus
+
 export mlogit, boot_mlogit,
        logit2, boot_logit2,
        regtable
@@ -27,7 +31,7 @@ export logit2_rfx, boot_logit2_rfx, theta0_rfx, boot_report, boot_vcov!, regtabl
        rfx_level_moments, theta0_rfx_multistart
 
 export mlogit_rfx, boot_mlogit_rfx, theta0_mlogit_rfx, theta0_mlogit_rfx_multistart,
-       rfx_term, rfx_cell_report
+       rfx_term, rfx_cell_report, RFX_SIGMA_PARAMETERIZATION
 
 include("MLE_objects.jl")
 

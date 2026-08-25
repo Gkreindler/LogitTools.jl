@@ -16,8 +16,10 @@
 #
 # For the lognormal families μ_m is the mean of log|β_irm| and that variable's X
 # column is dropped from the linear part (the exp() already carries the level),
-# so θ = [μ (K); σ (M)] in every case. The σ = 0 saddle and the σ -> -σ mirror
-# symmetry hold for all three: with antithetic draws {η_r} = {-η_r} as a set.
+# so θ = [μ (K); σ (M)] in every case. The public parameterisation always
+# has σ > 0. Internally the optimiser works with unconstrained ρ and maps it to
+# σ = log(1 + exp(ρ)); this prevents finite-draw sign artefacts from creating
+# different simulated objectives in different componentwise sign orthants.
 #   ℓ_ir  = Σ_t log λ_itr
 #   log L̂_i = logsumexp_r(ℓ_ir + logw_r)
 #
@@ -102,11 +104,72 @@ end
 """Distributions accepted in `rfx`. A bare symbol in `rfx` means `:normal`."""
 const _RFX_DISTS = (:normal, :lognormal, :neg_lognormal)
 
+"""Numerical lower bound that keeps fitted standard deviations strictly positive."""
+const _RFX_SIGMA_FLOOR = eps(Float64)
+
+"""Restart used when a fitted numerical-boundary sigma is supplied as theta0."""
+const _RFX_SIGMA_BOUNDARY_RESTART = 0.5
+
 """Is `d` a lognormal family, i.e. parameterised on the log scale?"""
 _rfx_is_log(d::Symbol) = (d === :lognormal) || (d === :neg_lognormal)
 
 """Sign of the coefficient's support: `-1.0` for `:neg_lognormal`, else `+1.0`."""
 _rfx_sign(d::Symbol) = d === :neg_lognormal ? -1.0 : 1.0
+
+"""
+    _rfx_positive_start(theta0, K, M) -> Vector{Float64}
+
+Map public parameters `[beta; sigma]`, with strictly positive standard
+deviations, to the optimiser's unconstrained `[beta; rho]` coordinates. The
+softplus inverse is stable for both small and large `sigma`.
+"""
+function _rfx_positive_start(theta0::Vector{Float64}, K::Int, M::Int)
+    phi = copy(theta0)
+    @inbounds for m in 1:M
+        sigma0 = theta0[K + m]
+        # A fitted boundary value can equal the numerical floor exactly. It is
+        # a stationary point in public coordinates, so lift only such
+        # machine-boundary starts before reusing a fit for a bootstrap.
+        sigma_start = sigma0 <= sqrt(_RFX_SIGMA_FLOOR) ?
+            _RFX_SIGMA_BOUNDARY_RESTART : sigma0
+        phi[K + m] = logexpm1(sigma_start - _RFX_SIGMA_FLOOR)
+    end
+    return phi
+end
+
+"""Map unconstrained `[beta; rho]` to public `[beta; sigma]` in place."""
+@inline function _rfx_positive_theta!(theta, phi, K::Int, M::Int)
+    copyto!(theta, phi)
+    @inbounds for m in 1:M
+        theta[K + m] = _RFX_SIGMA_FLOOR + log1pexp(phi[K + m])
+    end
+    return theta
+end
+
+"""
+    _rfx_positive_fg!(F, G, phi, K, M, theta, grad_theta, kernel)
+
+Optim `only_fg!` adapter for a likelihood kernel written in public
+`[beta; sigma]` coordinates. It applies the softplus map and the chain rule
+`dQ/drho = dQ/dsigma * logistic(rho)`. `theta` and `grad_theta` are fit-local
+scratch vectors captured by the caller, so no parameter-length vector is
+allocated on each likelihood evaluation.
+"""
+function _rfx_positive_fg!(F, G, phi::Vector{Float64}, K::Int, M::Int,
+                           theta::Vector{Float64}, grad_theta::Vector{Float64},
+                           kernel)
+    _rfx_positive_theta!(theta, phi, K, M)
+    value = kernel(F, isnothing(G) ? nothing : grad_theta, theta)
+
+    if !isnothing(G)
+        @views G[1:K] .= grad_theta[1:K]
+        @inbounds for m in 1:M
+            G[K + m] = grad_theta[K + m] * logistic(phi[K + m])
+        end
+    end
+
+    return value
+end
 
 """
     _normalize_rfx(rfx) -> Vector{Pair{Symbol,Symbol}}
@@ -175,6 +238,9 @@ function theta0_rfx(formula, rfx;
 
     length(b0) == K || error("b0 has length $(length(b0)) but formula has $K variables")
     length(s0) == M || error("s0 has length $(length(s0)) but rfx has $M variables")
+    all(>(_RFX_SIGMA_FLOOR), s0) || error(
+        "all s0 values must exceed the numerical sigma floor " *
+        "$(_RFX_SIGMA_FLOOR)")
 
     th = Float64[b0...; s0...]
 
@@ -636,9 +702,11 @@ end
 Inner estimation routine: takes a prepped `RfxPrep`, so the bootstrap can reuse
 prep and vary only the group weights `gw`.
 
-Canonicalises `σ ≥ 0` at the source, so that every path — the main fit and every
-bootstrap replicate — returns a canonical sign. Without this, `cov(theta_boot_table)`
-would mix the `2^M` mirror modes and be meaningless.
+Enforces `σ > 0` during optimisation with an internal softplus transformation.
+This matters with finite simulation draws: antithetic pairing makes a *joint*
+sign reversal exact, but generally does not make every componentwise sign reversal
+exact. Applying `abs()` after an unconstrained fit can therefore return parameters
+that do not attain the stored objective.
 
 By default this never throws: on failure it returns an `MLEFit` with
 `errored = true` and the message in `error_message`, so a single bad bootstrap
@@ -661,14 +729,21 @@ function _logit2_rfx(
     try
         buf = RfxBuffers(P)
 
-        fg! = (F, G, θ) -> _rfx_fg!(F, G, θ, P, buf, gw)
+        theta_work = similar(theta0)
+        grad_work  = similar(theta0)
+        kernel = (F, G, theta) -> _rfx_fg!(F, G, theta, P, buf, gw)
+        fg! = (F, G, phi) -> _rfx_positive_fg!(
+            F, G, phi, P.K, P.M, theta_work, grad_work, kernel)
+
+        phi0 = _rfx_positive_start(theta0, P.K, P.M)
 
         time_it_took = @elapsed opt = optimize(
-            Optim.only_fg!(fg!), copy(theta0), LBFGS(), optim_options)
+            Optim.only_fg!(fg!), phi0, LBFGS(), optim_options)
 
-        # mirror-mode canonicalisation, at the source
-        th = copy(Optim.minimizer(opt))
-        th[P.K+1:end] .= abs.(th[P.K+1:end])
+        # Return the public [beta; sigma] coordinates that the optimiser actually
+        # evaluated, so obj_value and theta_hat necessarily describe one point.
+        th = similar(theta0)
+        _rfx_positive_theta!(th, Optim.minimizer(opt), P.K, P.M)
 
         # ESS diagnostic at the fitted parameter
         ess = P.M > 0 ? _rfx_ess(th, P, buf) : fill(Float64(P.R), P.N)
@@ -693,6 +768,7 @@ function _logit2_rfx(
             extra = (; n_groups = P.N, K = P.K, M = P.M, R = P.R,
                        col_id = P.col_id, rfx = P.rfx_pairs,
                        rfx_cols = P.rfx_cols, seed = P.seed,
+                       sigma_parameterization = RFX_SIGMA_PARAMETERIZATION,
                        ess_min = ess_min, ess_p10 = ess_p10,
                        ess_median = ess_median, ess_mean = ess_mean,
                        Ti_min = minimum(Ti), Ti_median = median(Ti),
@@ -760,9 +836,13 @@ too easy to transpose silently.
 `[formula...; "sd_" .* rfx...]`. For a `:normal` coefficient `μ` is the mean of
 the coefficient, which is the usual `β`.
 
-Returned `σ` is always `≥ 0`: the likelihood satisfies `Q(μ, σ) = Q(μ, -σ)`, so
-there are `2^M` mirror optima and the sign is not identified. This holds for the
-lognormal families too, because antithetic draws make `{η_r} = {-η_r}` as a set.
+Returned `σ` is always `> 0`, enforced during optimisation through an internal
+softplus transformation. In the population likelihood each standard deviation's
+sign is immaterial. With a finite antithetic draw set, however, only reversing all
+draw dimensions together is guaranteed to be an exact permutation; flipping one
+component generally changes the simulated objective slightly. The positivity
+transformation keeps optimisation in one identified orthant and ensures
+`obj_value` is evaluated at `theta_hat`.
 
 # Lognormal coefficients
 With `:lognormal` the coefficient is `β_im = exp(μ_m + σ_m·η_im) > 0`, and with
@@ -1052,12 +1132,13 @@ function _check_theta0_rfx(theta0, P::RfxPrep)
         "theta0 has length $(length(th)) but the model has K + M = $(P.K) + $(P.M) = " *
         "$npar parameters. Use theta0_rfx(formula, rfx) to assemble it.")
 
-    if P.M > 0 && any(th[P.K+1:end] .== 0)
-        bad = findall(th[P.K+1:end] .== 0)
-        error("theta0 has σ = 0 for rfx variable(s) " *
-              "$(first.(P.rfx_pairs)[bad]): σ = 0 is a stationary point (a saddle) of " *
-              "the simulated likelihood, so the optimiser cannot move away from it. " *
-              "Use a nonzero start such as 0.5.")
+    if P.M > 0 && any(th[P.K+1:end] .< _RFX_SIGMA_FLOOR)
+        bad = findall(th[P.K+1:end] .< _RFX_SIGMA_FLOOR)
+        error("theta0 must have strictly positive σ for rfx variable(s) " *
+              "$(first.(P.rfx_pairs)[bad]); got $(th[P.K .+ bad]). Standard " *
+              "deviations are constrained at or above the numerical floor " *
+              "$(_RFX_SIGMA_FLOOR) during optimisation. Use a start " *
+              "such as 0.5.")
     end
 
     return th

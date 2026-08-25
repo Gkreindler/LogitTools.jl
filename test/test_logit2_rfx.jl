@@ -122,7 +122,38 @@ end
         P, buf, gw = _rfx_kernel_setup()
         Qp = LT._rfx_fg!(true, nothing, [0.4, -0.7, 0.2,  0.75, -0.4], P, buf, gw)
         Qm = LT._rfx_fg!(true, nothing, [0.4, -0.7, 0.2, -0.75,  0.4], P, buf, gw)
+        Qone = LT._rfx_fg!(true, nothing, [0.4, -0.7, 0.2, -0.75, -0.4], P, buf, gw)
         @test abs(Qp - Qm) < 1e-12
+        # Antithetic pairing negates the whole draw vector. It does not close the
+        # finite draw set under a sign change in just one component.
+        @test abs(Qp - Qone) > 1e-8
+    end
+
+    @testset "positive-sigma adapter gradient" begin
+        P, buf, gw = _rfx_kernel_setup()
+        K, M = P.K, P.M
+        phi = [0.4, -0.7, 0.2, -0.3, 0.6]
+        theta_work = similar(phi)
+        grad_work = similar(phi)
+        kernel = (F, G, theta) -> LT._rfx_fg!(F, G, theta, P, buf, gw)
+
+        G = zeros(length(phi))
+        LT._rfx_positive_fg!(true, G, phi, K, M, theta_work, grad_work, kernel)
+        fd = FiniteDiff.finite_difference_gradient(
+            p -> LT._rfx_positive_fg!(true, nothing, collect(p), K, M,
+                                      theta_work, grad_work, kernel),
+            phi, Val{:central})
+
+        @test maximum(abs.(G .- fd) ./ max.(1.0, abs.(fd))) < 1e-6
+        @test all(theta_work[K+1:end] .> 0)
+
+        # A fit at the numerical boundary must remain a valid bootstrap start;
+        # lift it away from the sigma = 0 saddle before transforming it back.
+        boundary = [zeros(K); fill(LT._RFX_SIGMA_FLOOR, M)]
+        restarted = similar(boundary)
+        LT._rfx_positive_theta!(
+            restarted, LT._rfx_positive_start(boundary, K, M), K, M)
+        @test restarted[K+1:end] ≈ fill(LT._RFX_SIGMA_BOUNDARY_RESTART, M)
     end
 
     @testset "draws are antithetic and mean zero" begin
@@ -172,6 +203,8 @@ end
         @test theta0_rfx([:a, :b], [:a]; b0 = [1.0, 2.0], s0 = [0.3]) == [1.0, 2.0, 0.3]
         @test_throws ErrorException theta0_rfx([:a, :b], [:a]; b0 = [1.0])
         @test_throws ErrorException theta0_rfx([:a, :b], [:a]; s0 = [0.3, 0.3])
+        @test_throws ErrorException theta0_rfx([:a, :b], [:a]; s0 = [0.0])
+        @test_throws ErrorException theta0_rfx([:a, :b], [:a]; s0 = [-0.3])
     end
 
     # -----------------------------------------------------------------------
@@ -226,7 +259,7 @@ end
     end
 
     # -----------------------------------------------------------------------
-    @testset "determinism and canonical sigma" begin
+    @testset "determinism and positive sigma" begin
         df = _rfx_testdata(N = 60, T = 6, K = 3, seed = 21, beta = [0.6, -0.9, 0.4],
                            sigma_true = [0.7, 0.4], rfx_idx = [1, 3])
         myxs = [:x1, :x2, :x3]
@@ -236,11 +269,18 @@ end
         f2 = logit2_rfx(df, myxs, :pick1, :personid, th0; rfx = [:x1, :x3], ndraws = 100, seed = 7)
         @test f1.theta_hat == f2.theta_hat                       # same seed -> identical
 
-        # sigma is canonicalised regardless of the sign of the start
-        f3 = logit2_rfx(df, myxs, :pick1, :personid, [th0[1:3]; -0.5; -0.5];
-                        rfx = [:x1, :x3], ndraws = 100, seed = 7)
-        @test all(f3.theta_hat[4:5] .>= 0)
-        @test all(f1.theta_hat[4:5] .>= 0)
+        @test all(f1.theta_hat[4:5] .> 0)
+        @test f1.extra.sigma_parameterization === :softplus
+        @test_throws ErrorException logit2_rfx(
+            df, myxs, :pick1, :personid, [th0[1:3]; -0.5; 0.5];
+            rfx = [:x1, :x3], ndraws = 100, seed = 7)
+
+        # Regression test for the old post-hoc abs() bug: the stored objective
+        # must be the objective at the public parameter vector that was returned.
+        P, gw = LT._prep_logit2_rfx(
+            df, myxs, :pick1, :personid, [:x1, :x3], 100, 7, nothing)
+        qhat = LT._rfx_fg!(true, nothing, f1.theta_hat, P, LT.RfxBuffers(P), gw)
+        @test f1.obj_value ≈ qhat atol = 1e-9 rtol = 1e-12
     end
 
     # -----------------------------------------------------------------------
@@ -283,8 +323,8 @@ end
         @test size(fit.vcov.theta_boot_table) == (20, 5)
         @test size(fit.vcov.V) == (5, 5)
         @test issymmetric(fit.vcov.V)
-        # every returned sigma is canonical, in every replicate
-        @test all(fit.vcov.theta_boot_table[:, 4:5] .>= 0)
+        # every returned sigma is positive, in every replicate
+        @test all(fit.vcov.theta_boot_table[:, 4:5] .> 0)
 
         rep = boot_report(fit)
         @test nrow(rep) == 5
@@ -420,9 +460,9 @@ end
 
             # digits_stats = 2 rounds both the SEs and the CI bounds; SEs come in
             # parentheses and intervals in square brackets
-            @test occursin("(" * string(round(st.se[1], digits = 2)) * ")", s_nostar)
-            @test occursin("[" * string(round(st.ci_lo[4], digits = 2)) * ", " *
-                           string(round(st.ci_hi[4], digits = 2)) * "]", s_nostar)
+            @test occursin("(" * LT._rfx_num(st.se[1], 2) * ")", s_nostar)
+            @test occursin("[" * LT._rfx_fmt(AsciiTable(), st.ci_lo[4], 2, true) * ", " *
+                           LT._rfx_fmt(AsciiTable(), st.ci_hi[4], 2, true) * "]", s_nostar)
             # an interval is never wrapped in parentheses
             @test !occursin("(" * string(round(st.ci_lo[4], digits = 2)) * ", ", s_nostar)
             # ... and 3 digits (the default) gives a different rendering
@@ -716,9 +756,8 @@ end
 
         # -------------------------------------------------------------------
         @testset "mirror symmetry Q(mu, s) == Q(mu, -s)" begin
-            # Holds for the lognormal families too, because antithetic draws make
-            # the draw set symmetric. This is what justifies keeping the abs()
-            # canonicalisation and the percentile CIs on the sigma rows.
+            # Joint reversal holds for the lognormal families too, because
+            # antithetic draws negate the whole draw vector together.
             P, buf, gw = _ln_setup([:x1 => :lognormal, :x2 => :neg_lognormal])
             Qp = LT._rfx_fg!(true, nothing, [0.3, -0.2, 0.4, 0.1,  0.7, -0.45], P, buf, gw)
             Qm = LT._rfx_fg!(true, nothing, [0.3, -0.2, 0.4, 0.1, -0.7,  0.45], P, buf, gw)

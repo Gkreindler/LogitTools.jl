@@ -255,7 +255,7 @@ println("  sd_1|alt = ", round(f0.theta_hat[5], digits = 3), "   (truth 0)")
 println("  sd_x1    = ", round(f0.theta_hat[4], digits = 3), "   (truth $SIGMA_G)")
 println()
 println("  A small positive number rather than 0 is expected: sigma is")
-println("  canonicalised with abs(), so noise around a true zero always reads")
+println("  constrained positive, so noise around a true zero always reads")
 println("  positive. That is why such a row should be read off its percentile")
 println("  interval as \"cannot reject homogeneity\", not as a small effect.")
 

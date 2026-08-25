@@ -1086,6 +1086,9 @@ function theta0_mlogit_rfx(formula, rfx;
 
     length(b0) == K || error("b0 has length $(length(b0)) but formula has $K variables")
     length(s0) == M || error("s0 has length $(length(s0)) but rfx has $M terms")
+    all(>(_RFX_SIGMA_FLOOR), s0) || error(
+        "all s0 values must exceed the numerical sigma floor " *
+        "$(_RFX_SIGMA_FLOOR)")
 
     th    = Float64[b0...; s0...]
     terms = _normalize_mlogit_rfx(rfx, Symbol.(formula), col_group)
@@ -1162,12 +1165,13 @@ function _check_theta0_mlogit_rfx(theta0, P::MlogitRfxPrep)
         "theta0 has length $(length(th)) but the model has K + M = $(P.K) + $(P.M) = " *
         "$npar parameters. Use theta0_mlogit_rfx(formula, rfx) to assemble it.")
 
-    if P.M > 0 && any(th[P.K+1:end] .== 0)
-        bad = findall(th[P.K+1:end] .== 0)
-        error("theta0 has sigma = 0 for rfx term(s) " *
-              "$([P.terms[b].name for b in bad]): sigma = 0 is a stationary point (a " *
-              "saddle) of the simulated likelihood, so the optimiser cannot move away " *
-              "from it. Use a nonzero start such as 0.5.")
+    if P.M > 0 && any(th[P.K+1:end] .< _RFX_SIGMA_FLOOR)
+        bad = findall(th[P.K+1:end] .< _RFX_SIGMA_FLOOR)
+        error("theta0 must have strictly positive sigma for rfx term(s) " *
+              "$([P.terms[b].name for b in bad]); got $(th[P.K .+ bad]). Standard " *
+              "deviations are constrained at or above the numerical floor " *
+              "$(_RFX_SIGMA_FLOOR) during optimisation. Use a start " *
+              "such as 0.5.")
     end
 
     return th
@@ -1216,9 +1220,10 @@ end
 Inner estimation routine: takes a prepped [`MlogitRfxPrep`](@ref), so the
 bootstrap can reuse prep and vary only the group weights `gw`.
 
-Canonicalises `sigma >= 0` at the source, so that every path -- the main fit and
-every bootstrap replicate -- returns a canonical sign. Without this,
-`cov(theta_boot_table)` would mix the `2^M` mirror modes and be meaningless.
+Enforces `sigma > 0` during optimisation with the shared softplus transformation.
+With finite antithetic draws, applying `abs()` to separate sigma components after
+an unconstrained fit can change the simulated objective; the transformation keeps
+the optimiser and the returned parameters in the same identified orthant.
 
 By default this never throws: on failure it returns an `MLEFit` with
 `errored = true` and the message in `error_message`, so a single bad bootstrap
@@ -1237,14 +1242,19 @@ function _mlogit_rfx(
     local myfit
     try
         buf = MlogitRfxBuffers(P)
-        fg! = (F, G, th) -> _mlogit_rfx_fg!(F, G, th, P, buf, gw)
+        theta_work = similar(theta0)
+        grad_work  = similar(theta0)
+        kernel = (F, G, theta) -> _mlogit_rfx_fg!(F, G, theta, P, buf, gw)
+        fg! = (F, G, phi) -> _rfx_positive_fg!(
+            F, G, phi, P.K, P.M, theta_work, grad_work, kernel)
+
+        phi0 = _rfx_positive_start(theta0, P.K, P.M)
 
         time_it_took = @elapsed opt = optimize(
-            Optim.only_fg!(fg!), copy(theta0), LBFGS(), optim_options)
+            Optim.only_fg!(fg!), phi0, LBFGS(), optim_options)
 
-        # mirror-mode canonicalisation, at the source
-        th = copy(Optim.minimizer(opt))
-        th[P.K+1:end] .= abs.(th[P.K+1:end])
+        th = similar(theta0)
+        _rfx_positive_theta!(th, Optim.minimizer(opt), P.K, P.M)
 
         ess = P.M > 0 ? _mlogit_rfx_ess(th, P, buf) : fill(Float64(P.R), P.N)
 
@@ -1270,6 +1280,7 @@ function _mlogit_rfx(
                        rfx = P.rfx_pairs, rfx_cols = P.rfx_cols,
                        rfx_terms = P.terms, cell_stats = P.cell_stats,
                        seed = P.seed,
+                       sigma_parameterization = RFX_SIGMA_PARAMETERIZATION,
                        ess_min = minimum(ess), ess_p10 = quantile(ess, 0.10),
                        ess_median = median(ess), ess_mean = mean(ess),
                        Ti_min = minimum(Ti), Ti_median = median(Ti),
@@ -1447,9 +1458,10 @@ holding "this row's alternative", so there is nothing for a level to point at.
 # Parameter ordering
 `theta = [mu (K, formula order); sigma (M, rfx order)]`, named
 `[formula...; "sd_" .* term names]`, where a term's name is `x` at the group level
-and `x|level` / `1|level` otherwise. Returned `sigma` is always `>= 0`: the
-likelihood satisfies `Q(mu, sigma) = Q(mu, -sigma)`, so there are `2^M` mirror
-optima and the sign is not identified.
+and `x|level` / `1|level` otherwise. Returned `sigma` is always `> 0`, enforced
+during optimisation through an internal softplus transformation. This keeps the
+fit in one identified orthant and makes the stored objective correspond exactly to
+the returned parameters even when finite draws are not componentwise sign-symmetric.
 
 # What is *not* identified
 Three failures are checked in prep rather than left to produce a plausible number:
@@ -1472,8 +1484,8 @@ The integral's dimension is the number of *cells* in a group, not the number of
 terms, so an option-level effect over 20 alternatives is a 20-dimensional integral.
 Watch `extra.ess_p10`, and check `sigma` across seeds before reporting it: because
 draws are fixed across bootstrap replicates (they must be, or the objective is not
-deterministic in theta), simulation error never enters `boot_se`, and `abs()`
-canonicalisation makes noise around a true zero read as a positive number.
+deterministic in theta), simulation error never enters `boot_se`, and the positive
+constraint makes noise around a true zero read as a positive number.
 
 # Example
 ```julia
