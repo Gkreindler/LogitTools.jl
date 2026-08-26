@@ -1527,7 +1527,22 @@ function _mlogit_rfx_multi(P::MlogitRfxPrep, theta0s::AbstractMatrix{Float64},
     task = r -> _mlogit_rfx(P, Vector{Float64}(view(theta0s, r, :)), gw, optim_options;
                             rethrow_errors = rethrow_errors)
 
-    fits = parallel ? pmap(task, CachingPool(workers()), 1:nstarts) : map(task, 1:nstarts)
+    fits = if parallel
+        # The prepped simulated likelihood can be hundreds of MB at large R.
+        # A CachingPool keeps the task closure (and therefore P) resident on
+        # every worker until it is explicitly cleared. Repeated multi-start
+        # calls at different draw seeds otherwise accumulate old P objects and
+        # can eventually fail while serialising the next one. Scope the cache to
+        # this fit and release it deterministically when pmap returns or throws.
+        pool = CachingPool(workers())
+        try
+            pmap(task, pool, 1:nstarts)
+        finally
+            clear!(pool)
+        end
+    else
+        map(task, 1:nstarts)
+    end
 
     objs = [f.obj_value for f in fits]
     ok   = [(!f.errored) && f.converged for f in fits]
