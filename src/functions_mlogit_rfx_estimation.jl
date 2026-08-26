@@ -37,6 +37,11 @@
 # Terms
 # ----------------------------------------------------------------------------
 
+# Keep the public correlation strictly inside (-1, 1). The small margin prevents
+# `sqrt(1-rho^2)` and its derivative from becoming singular after `tanh` rounds
+# to exactly one at a large optimiser coordinate.
+const _MLOGIT_RFX_CORR_LIMIT = 1.0 - sqrt(eps(Float64))
+
 """
 One random-coefficient term of an [`mlogit_rfx`](@ref) model.
 
@@ -46,9 +51,9 @@ the right normalisation, because the *mean* effect of a level value is either a
 fixed effect in `formula` or not identified at all -- only the spread around it
 is new information.
 
-`col` is the formula position of `var`, or `0` for an intercept. `at_group`
-records whether the level is the integration unit itself, which is the
-`logit2_rfx` case.
+`col` is the formula position of `var`, or `0` when the loading has no fixed
+mean in `formula` (including an intercept). `at_group` records whether the level
+is the integration unit itself, which is the `logit2_rfx` case.
 """
 struct MlogitRfxTerm
     var::Union{Nothing, Symbol}
@@ -60,7 +65,7 @@ struct MlogitRfxTerm
 end
 
 """
-    rfx_term(var = nothing; level = nothing, dist = :normal)
+    rfx_term(var = nothing; level = nothing, dist = :normal, mean = true)
 
 Describe one random-coefficient term for [`mlogit_rfx`](@ref).
 
@@ -73,6 +78,11 @@ Describe one random-coefficient term for [`mlogit_rfx`](@ref).
 - `dist`: `:normal`, `:lognormal` or `:neg_lognormal`, as in [`logit2_rfx`](@ref).
   The lognormal families need a `var` (their `mu` is an estimated formula
   coefficient), so they cannot be used for an intercept term.
+- `mean`: whether `var` must also appear in `formula` as the coefficient's fixed
+  mean. The default is `true`, preserving the existing random-slope contract.
+  Set `mean = false` for a centered normal factor loading whose variable is used
+  only by the random part. This is useful when one latent factor loads on a sum
+  of fixed-effect regressors without introducing a collinear fixed coefficient.
 
 Plain `Symbol` and `Pair` entries in `rfx` still mean what they mean in
 `logit2_rfx` -- a random coefficient on that variable, at the group level -- so
@@ -82,14 +92,19 @@ Plain `Symbol` and `Pair` entries in `rfx` still mean what they mean in
 ```julia
 rfx = [:any_fam,                              # agent-level normal coefficient
        :dur => :neg_lognormal,                # agent-level lognormal coefficient
+       rfx_term(:net_value; mean = false),    # centered agent-level factor loading
        rfx_term(level = :nbh_code),           # option-level random intercept
        rfx_term(:salient; level = :nbh_code)] # option-level random slope
 ```
 """
-rfx_term(var = nothing; level = nothing, dist = :normal) =
-    (var   = isnothing(var)   ? nothing : Symbol(var),
-     level = isnothing(level) ? nothing : Symbol(level),
-     dist  = Symbol(dist))
+function rfx_term(var = nothing; level = nothing, dist = :normal, mean::Bool = true)
+    base = (var   = isnothing(var)   ? nothing : Symbol(var),
+            level = isnothing(level) ? nothing : Symbol(level),
+            dist  = Symbol(dist))
+    # Preserve the exact pre-extension NamedTuple for every existing call. The
+    # extra field is emitted only when the caller requests the new behavior.
+    return mean ? base : merge(base, (mean = false,))
+end
 
 """
     _normalize_mlogit_rfx(rfx, formula_syms, col_group) -> Vector{MlogitRfxTerm}
@@ -110,20 +125,21 @@ function _normalize_mlogit_rfx(rfx, formula_syms, col_group::Symbol)
     terms = MlogitRfxTerm[]
 
     for (j, r) in enumerate(rfx)
-        v, lv, d = if isa(r, Symbol)
-            (r, nothing, :normal)
+        v, lv, d, has_mean = if isa(r, Symbol)
+            (r, nothing, :normal, true)
         elseif isa(r, AbstractString)
-            (Symbol(r), nothing, :normal)
+            (Symbol(r), nothing, :normal, true)
         elseif isa(r, Pair)
-            (Symbol(first(r)), nothing, Symbol(last(r)))
+            (Symbol(first(r)), nothing, Symbol(last(r)), true)
         elseif isa(r, NamedTuple)
-            bad = setdiff(collect(keys(r)), (:var, :level, :dist))
+            bad = setdiff(collect(keys(r)), (:var, :level, :dist, :mean))
             isempty(bad) || error(
                 "rfx entry $j has unknown field(s) $(bad); a random-coefficient term " *
-                "accepts only (var, level, dist). Build it with rfx_term.")
+                "accepts only (var, level, dist, mean). Build it with rfx_term.")
             (haskey(r, :var)   && !isnothing(r.var)   ? Symbol(r.var)   : nothing,
              haskey(r, :level) && !isnothing(r.level) ? Symbol(r.level) : nothing,
-             haskey(r, :dist)  && !isnothing(r.dist)  ? Symbol(r.dist)  : :normal)
+             haskey(r, :dist)  && !isnothing(r.dist)  ? Symbol(r.dist)  : :normal,
+             haskey(r, :mean)  && !isnothing(r.mean)  ? Bool(r.mean)    : true)
         else
             error("rfx entry $j has type $(typeof(r)), which is not a random-coefficient " *
                   "term. Accepted: :x, :x => :lognormal, or rfx_term(:x; level = :g). " *
@@ -140,19 +156,19 @@ function _normalize_mlogit_rfx(rfx, formula_syms, col_group::Symbol)
         col = 0
         if !isnothing(v)
             k = findfirst(==(v), formula_syms)
-            isnothing(k) && error(
+            has_mean && isnothing(k) && error(
                 "rfx variable :$v (entry $j) is not in formula. Available: $(formula_syms). " *
-                "A random coefficient needs its mean in the formula; for a pure " *
-                "random effect with no mean, use rfx_term(level = :$level) instead.")
-            col = k
+                "A random coefficient needs its mean in the formula by default. For a " *
+                "centered random loading with no fixed mean, use " *
+                "rfx_term(:$v; level = :$level, mean = false).")
+            isnothing(k) || (col = k)
         end
 
-        if _rfx_is_log(d) && isnothing(v)
-            error("rfx entry $j is an intercept term with dist = :$d. The lognormal " *
+        if _rfx_is_log(d) && (isnothing(v) || col == 0)
+            error("rfx entry $j has dist = :$d but no fixed formula mean. The lognormal " *
                   "families are parameterised as +-exp(mu + sigma*eta), and an " *
-                  "intercept term has no mu to estimate, so exp(sigma*eta) would only " *
-                  "fix an arbitrary scale (its median is +-1). Give the term a formula " *
-                  "variable, or use :normal.")
+                  "intercept or mean-free loading has no mu to estimate. Put the variable " *
+                  "in formula with mean = true, or use :normal.")
         end
 
         name = isnothing(v) ? "1|$(level)" :
@@ -186,6 +202,67 @@ function _normalize_mlogit_rfx(rfx, formula_syms, col_group::Symbol)
     end
 
     return terms
+end
+
+"""
+    _normalize_mlogit_rfx_corr(rfx_corr, terms) -> Vector{NTuple{2,Int}}
+
+Resolve bivariate correlation blocks against the normalised random-effect terms.
+Each entry is a `Pair` or two-tuple of term names (or indices). Correlation is
+currently deliberately limited to disjoint pairs of group-level normal terms:
+that is the covariance structure needed for correlated person effects, and the
+restriction prevents a partial or non-positive-definite covariance matrix from
+being specified accidentally.
+
+The returned indices are ordered by term position, so writing `(a, v)` or `(v,
+a)` produces the identical finite-draw likelihood.
+"""
+function _normalize_mlogit_rfx_corr(rfx_corr, terms::Vector{MlogitRfxTerm})
+    resolve(x) = if x isa Integer
+        1 <= x <= length(terms) || error(
+            "rfx_corr term index $x is outside 1:$(length(terms))")
+        Int(x)
+    else
+        name = string(x)
+        hits = findall(t -> t.name == name, terms)
+        length(hits) == 1 || error(
+            "rfx_corr term $(repr(x)) matched $(length(hits)) terms; available term " *
+            "names are $([t.name for t in terms])")
+        only(hits)
+    end
+
+    out  = NTuple{2,Int}[]
+    used = Set{Int}()
+    for (b, entry) in enumerate(rfx_corr)
+        x, y = if entry isa Pair
+            (first(entry), last(entry))
+        elseif entry isa Tuple && length(entry) == 2
+            entry
+        else
+            error("rfx_corr entry $b must be a Pair or two-tuple of term names/indices; " *
+                  "got $(repr(entry))")
+        end
+        p, q = sort((resolve(x), resolve(y)))
+        p == q && error("rfx_corr entry $b names the same term twice: $(terms[p].name)")
+        (!terms[p].at_group || !terms[q].at_group) && error(
+            "rfx_corr entry $b ($(terms[p].name), $(terms[q].name)) is not a pair of " *
+            "group-level terms. Correlated blocks currently support person-level " *
+            "normal coefficients only.")
+        (terms[p].dist !== :normal || terms[q].dist !== :normal) && error(
+            "rfx_corr entry $b ($(terms[p].name), $(terms[q].name)) contains a " *
+            "non-normal term. Correlation blocks require :normal coefficients.")
+        (!isnothing(terms[p].var) && !isnothing(terms[q].var)) || error(
+            "rfx_corr entry $b contains a random intercept. A group-level intercept " *
+            "cancels from every choice set and cannot be correlated meaningfully.")
+        (p in used || q in used) && error(
+            "rfx_corr blocks must be disjoint; term $(p in used ? terms[p].name : terms[q].name) " *
+            "appears in more than one block.")
+        push!(out, (p, q))
+        push!(used, p); push!(used, q)
+    end
+
+    length(unique(out)) == length(out) || error("rfx_corr contains a duplicate block")
+    return out
 end
 
 
@@ -265,6 +342,7 @@ struct MlogitRfxPrep
     group_ids::Vector                     # N, unique col_group values in sorted order
     K::Int
     M::Int
+    B::Int                                # number of bivariate correlation blocks
     R::Int
     N::Int
     Tmax::Int                             # max rows per group
@@ -275,6 +353,10 @@ struct MlogitRfxPrep
     rfx_islog::Vector{Bool}
     rfx_sgn::Vector{Float64}
     any_log::Bool
+    corr_pairs::Vector{NTuple{2,Int}}     # term indices (first is the draw anchor)
+    corr_second::Vector{Int}              # term -> block index, zero unless second
+    corr_cells::Matrix{Int}               # N x 2B, group-local cells for each block
+    corr_names::Vector{String}
     theta_names::Vector{String}
     col_id::Symbol                        # choice set
     col_group::Symbol                     # integration unit
@@ -306,7 +388,7 @@ end
 
 """
     _prep_mlogit_rfx(data_df, formula, col_id, col_selected, col_group, rfx,
-                     ndraws, seed, weights) -> (P, gw)
+                     ndraws, seed, weights, rfx_corr = []) -> (P, gw)
 
 Build an [`MlogitRfxPrep`](@ref). Does **not** mutate `data_df`.
 
@@ -321,7 +403,8 @@ function _prep_mlogit_rfx(
         rfx,
         ndraws::Int,
         seed::Int,
-        weights::Union{Nothing, Symbol, String})
+        weights::Union{Nothing, Symbol, String},
+        rfx_corr = [])
 
     formula_syms = Symbol.(formula)
     K = length(formula_syms)
@@ -329,11 +412,14 @@ function _prep_mlogit_rfx(
 
     terms = _normalize_mlogit_rfx(rfx, formula_syms, col_group)
     M     = length(terms)
+    corr_pairs = _normalize_mlogit_rfx_corr(rfx_corr, terms)
+    B          = length(corr_pairs)
 
     # --- column presence ----------------------------------------------------
     dfnames = Symbol.(names(data_df))
+    loading_vars = Symbol[t.var for t in terms if !isnothing(t.var)]
     needed  = vcat(formula_syms, Symbol(col_selected), col_id, col_group,
-                   [t.level for t in terms])
+                   [t.level for t in terms], loading_vars)
     for c in unique(needed)
         c in dfnames || error("column :$c not found in data_df")
     end
@@ -461,13 +547,24 @@ function _prep_mlogit_rfx(
 
     ncells = length(cell_term)
 
+    # A correlation block is restricted to two group-level terms, hence one
+    # cell per term and group. Cache those local cell indices once rather than
+    # searching `cell_term` inside every likelihood evaluation.
+    corr_cells = Matrix{Int}(undef, N, 2B)
+    for (i, rg) in enumerate(ranges), (b, (p, q)) in enumerate(corr_pairs)
+        corr_cells[i, 2b-1] = cellloc[first(rg), p]
+        corr_cells[i, 2b]   = cellloc[first(rg), q]
+    end
+
     # --- loadings -----------------------------------------------------------
     zmatrix = Matrix{Float64}(undef, Nobs, M)
     for (m, t) in enumerate(terms)
         if isnothing(t.var)
             @views zmatrix[:, m] .= 1.0
-        else
+        elseif t.col > 0
             @views zmatrix[:, m] .= xmatrix[:, t.col]
+        else
+            @views zmatrix[:, m] .= Float64.(data_df[perm, t.var])
         end
     end
 
@@ -476,6 +573,11 @@ function _prep_mlogit_rfx(
     rfx_sgn   = Float64[_rfx_sign(t.dist) for t in terms]
     rfx_cols  = Int[t.col for t in terms]
     any_log   = any(rfx_islog)
+    corr_second = zeros(Int, M)
+    for (b, (_, q)) in enumerate(corr_pairs)
+        corr_second[q] = b
+    end
+    corr_names = ["cor_$(terms[p].name)__$(terms[q].name)" for (p, q) in corr_pairs]
 
     xlin = xmatrix
     if any_log
@@ -517,15 +619,16 @@ function _prep_mlogit_rfx(
     # --- draws --------------------------------------------------------------
     eta, logw = _make_cell_draws(cells_per_group, ndraws, seed)
 
-    theta_names = [string.(formula_syms); ["sd_" * t.name for t in terms]]
+    theta_names = [string.(formula_syms); ["sd_" * t.name for t in terms]; corr_names]
     rfx_pairs   = Pair{Symbol,Symbol}[Symbol(t.name) => t.dist for t in terms]
 
     P = MlogitRfxPrep(
         xmatrix, xlin, zmatrix, yvec, cellloc,
         ranges, set_ranges, set_of_group, sel_row,
         cell_ranges, cell_term, eta, logw, group_ids,
-        K, M, ndraws, N, Tmax, Cmax,
+        K, M, B, ndraws, N, Tmax, Cmax,
         terms, rfx_pairs, rfx_cols, rfx_islog, rfx_sgn, any_log,
+        corr_pairs, corr_second, corr_cells, corr_names,
         theta_names, col_id, col_group, seed, n_sets, cell_stats)
 
     return P, gw
@@ -764,7 +867,7 @@ end
 # ----------------------------------------------------------------------------
 
 """
-    _mlogit_rfx_fill_A!(Ai, beta, sigma, etai, ct, P)
+    _mlogit_rfx_fill_A!(Ai, beta, sigma, corr, etai, ct, corr_cells, P)
 
 Fill `Ai` (`C_i x R`) with the quantity that multiplies the loading in the linear
 index, one row per cell of the current group:
@@ -775,8 +878,17 @@ index, one row per cell of the current group:
 where `m = ct[c]` is the cell's term. `xlin` has the lognormal columns zeroed,
 which is why the second line is the whole coefficient and not a deviation. The
 sign of `:neg_lognormal` is folded in here, so nothing downstream knows about it.
+
+For correlation block `(p,q)`, the two group-level normal coefficients use
+
+    A_p = sigma_p * eta_p
+    A_q = sigma_q * (rho * eta_p + sqrt(1-rho^2) * eta_q),
+
+so `sigma_p` and `sigma_q` remain marginal standard deviations and `rho` is
+their correlation. `corr_cells` supplies the two group-local draw rows.
 """
-@inline function _mlogit_rfx_fill_A!(Ai, beta, sigma, etai, ct, P::MlogitRfxPrep)
+@inline function _mlogit_rfx_fill_A!(Ai, beta, sigma, corr, etai, ct, corr_cells,
+                                     P::MlogitRfxPrep)
 
     Ci = length(ct)
 
@@ -784,21 +896,32 @@ sign of `:neg_lognormal` is folded in here, so nothing downstream knows about it
         @inbounds for r in 1:P.R, c in 1:Ci
             Ai[c, r] = sigma[ct[c]] * etai[c, r]
         end
-        return nothing
+    else
+        @inbounds for r in 1:P.R, c in 1:Ci
+            m = ct[c]
+            Ai[c, r] = P.rfx_islog[m] ?
+                P.rfx_sgn[m] * exp(beta[P.rfx_cols[m]] + sigma[m] * etai[c, r]) :
+                sigma[m] * etai[c, r]
+        end
     end
 
-    @inbounds for r in 1:P.R, c in 1:Ci
-        m = ct[c]
-        Ai[c, r] = P.rfx_islog[m] ?
-            P.rfx_sgn[m] * exp(beta[P.rfx_cols[m]] + sigma[m] * etai[c, r]) :
-            sigma[m] * etai[c, r]
+    # Override the second coefficient in each block with the correlated normal
+    # combination. The first coefficient already has sigma_p * eta_p above.
+    @inbounds for b in 1:P.B
+        cp, cq = corr_cells[2b-1], corr_cells[2b]
+        rho    = corr[b]
+        root   = sqrt(1.0 - rho * rho)
+        q      = P.corr_pairs[b][2]
+        for r in 1:P.R
+            Ai[cq, r] = sigma[q] * (rho * etai[cp, r] + root * etai[cq, r])
+        end
     end
 
     # exp() overflows to Inf above an exponent of ~709, and Inf then propagates
     # into the gradient as Inf*0 = NaN, from which LBFGS cannot recover -- it
     # would report a converged fit at a garbage theta. Fail with the cause named
     # instead. O(C_i*R) with C_i small, so this is free next to the T_i x R work.
-    if !all(isfinite, view(Ai, 1:Ci, :))
+    if P.any_log && !all(isfinite, view(Ai, 1:Ci, :))
         lg = findall(P.rfx_islog)
         error("a lognormal random coefficient overflowed: exp(mu + sigma*eta) is not " *
               "finite at mu = $(round.([beta[P.rfx_cols[m]] for m in lg], digits = 3)), " *
@@ -840,15 +963,17 @@ so the extra nesting level costs O(T_i*R*M) with M small, not a factor of R.
 function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
                          buf::MlogitRfxBuffers, gw::Union{Nothing, Vector{Float64}})
 
-    K, M, R = P.K, P.M, P.R
+    K, M, B, R = P.K, P.M, P.B, P.R
 
     beta  = view(theta, 1:K)
     sigma = view(theta, K+1:K+M)
+    corr  = view(theta, K+M+1:K+M+B)
 
     need_g = G !== nothing
     need_g && fill!(G, 0.0)
     gb = need_g ? view(G, 1:K)     : nothing
     gs = need_g ? view(G, K+1:K+M) : nothing
+    gc = need_g ? view(G, K+M+1:K+M+B) : nothing
 
     scatter = need_g && M > 0
     Q = 0.0
@@ -868,6 +993,7 @@ function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
 
         etai = view(P.eta, crng, :)        # Ci x R
         ct   = view(P.cell_term, crng)     # Ci
+        cc   = view(P.corr_cells, i, :)    # 2B group-local correlated cells
         Ai   = view(buf.A, 1:Ci, :)
         Si   = view(buf.S, 1:Ci, :)
         Vi   = view(buf.V, 1:Ti, :)
@@ -876,7 +1002,7 @@ function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
         eb   = view(buf.ebar, 1:Ti)
 
         # --- 1. per-cell coefficients ---------------------------------------
-        M > 0 && _mlogit_rfx_fill_A!(Ai, beta, sigma, etai, ct, P)
+        M > 0 && _mlogit_rfx_fill_A!(Ai, beta, sigma, corr, etai, ct, cc, P)
 
         # --- 2. linear index ------------------------------------------------
         mul!(xb, Xi, beta)
@@ -956,7 +1082,18 @@ function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
                             gs[m]             -= co * etai[c, r] * Ai[c, r]
                             gb[P.rfx_cols[m]] -= co * Ai[c, r]
                         else
-                            gs[m] -= co * etai[c, r]
+                            b = P.corr_second[m]
+                            if b == 0
+                                gs[m] -= co * etai[c, r]
+                            else
+                                cp   = cc[2b-1]
+                                rho  = corr[b]
+                                root = sqrt(1.0 - rho * rho)
+                                zeta = rho * etai[cp, r] + root * etai[c, r]
+                                gs[m] -= co * zeta
+                                gc[b] -= co * sigma[m] *
+                                         (etai[cp, r] - (rho / root) * etai[c, r])
+                            end
                         end
                     end
                 end
@@ -985,9 +1122,10 @@ the same `R` draws. A collapsing ESS is how that shows up.
 function _mlogit_rfx_ess(theta::Vector{Float64}, P::MlogitRfxPrep,
                          buf::MlogitRfxBuffers)
 
-    K, M, R = P.K, P.M, P.R
+    K, M, B, R = P.K, P.M, P.B, P.R
     beta  = view(theta, 1:K)
     sigma = view(theta, K+1:K+M)
+    corr  = view(theta, K+M+1:K+M+B)
 
     ess = Vector{Float64}(undef, P.N)
 
@@ -1003,11 +1141,12 @@ function _mlogit_rfx_ess(theta::Vector{Float64}, P::MlogitRfxPrep,
         Li   = view(P.cellloc, rrng, :)
         etai = view(P.eta, crng, :)
         ct   = view(P.cell_term, crng)
+        cc   = view(P.corr_cells, i, :)
         Ai   = view(buf.A, 1:Ci, :)
         Vi   = view(buf.V, 1:Ti, :)
         xb   = view(buf.xb, 1:Ti)
 
-        M > 0 && _mlogit_rfx_fill_A!(Ai, beta, sigma, etai, ct, P)
+        M > 0 && _mlogit_rfx_fill_A!(Ai, beta, sigma, corr, etai, ct, cc, P)
 
         mul!(xb, Xi, beta)
         if M > 0
@@ -1054,24 +1193,50 @@ end
 # Starting values
 # ----------------------------------------------------------------------------
 
+"""Map public `[beta; sigma; corr]` parameters to unconstrained coordinates."""
+function _mlogit_rfx_unconstrained_start(theta0::Vector{Float64}, K::Int, M::Int,
+                                         B::Int)
+    phi = _rfx_positive_start(theta0, K, M)
+    @inbounds for b in 1:B
+        phi[K + M + b] = atanh(theta0[K + M + b] / _MLOGIT_RFX_CORR_LIMIT)
+    end
+    return phi
+end
+
+"""Map unconstrained coordinates to public `[beta; sigma; corr]` in place."""
+@inline function _mlogit_rfx_public_theta!(theta, phi, K::Int, M::Int, B::Int)
+    _rfx_positive_theta!(theta, phi, K, M)
+    @inbounds for b in 1:B
+        theta[K + M + b] = _MLOGIT_RFX_CORR_LIMIT * tanh(phi[K + M + b])
+    end
+    return theta
+end
+
+"""Optim adapter applying softplus to standard deviations and tanh to correlations."""
+function _mlogit_rfx_unconstrained_fg!(F, G, phi::Vector{Float64}, K::Int, M::Int,
+                                       B::Int, theta::Vector{Float64},
+                                       grad_theta::Vector{Float64}, kernel)
+    _mlogit_rfx_public_theta!(theta, phi, K, M, B)
+    value = kernel(F, isnothing(G) ? nothing : grad_theta, theta)
+
+    if !isnothing(G)
+        @views G[1:K] .= grad_theta[1:K]
+        @inbounds for m in 1:M
+            G[K + m] = grad_theta[K + m] * logistic(phi[K + m])
+        end
+        @inbounds for b in 1:B
+            z = tanh(phi[K + M + b])
+            G[K + M + b] = grad_theta[K + M + b] *
+                             _MLOGIT_RFX_CORR_LIMIT * (1.0 - z * z)
+        end
+    end
+
+    return value
+end
+
 """
-    theta0_mlogit_rfx(formula, rfx; b0, s0, col_group) -> Vector{Float64}
-
-Assemble a starting vector `[mu; sigma]` for [`mlogit_rfx`](@ref).
-
-The `mlogit_rfx` counterpart of [`theta0_rfx`](@ref): same contract, but it
-accepts the `rfx_term` entries too, and so needs `col_group` in order to work out
-which terms are at the group level.
-
-Default `s0 = 0.5`, never `0.0`: `sigma = 0` is a stationary point (a saddle) of
-the simulated likelihood, so an optimiser started there cannot move.
-
-`b0` is given on the **level** scale for every variable -- the scale of a plain
-`mlogit` coefficient -- including the lognormal ones. For a `:lognormal` or
-`:neg_lognormal` term on formula position `k`, this converts it to the log scale
-that `mlogit_rfx` actually estimates,
-
-    mu_k = log|b0_k| - s0_m^2 / 2
+    theta0_mlogit_rfx(formula, rfx; b0, s0, rfx_corr, corr0, col_group)
+        -> Vector{Float64}
 
 which is the value whose implied mean coefficient `+-exp(mu + sigma^2/2)` equals
 `b0_k`.
@@ -1079,19 +1244,27 @@ which is the value whose implied mean coefficient `+-exp(mu + sigma^2/2)` equals
 function theta0_mlogit_rfx(formula, rfx;
                            b0 = zeros(length(formula)),
                            s0 = fill(0.5, length(rfx)),
+                           rfx_corr = [],
+                           corr0 = fill(0.0, length(rfx_corr)),
                            col_group::Symbol = :__group__)
 
     K = length(formula)
     M = length(rfx)
+    terms = _normalize_mlogit_rfx(rfx, Symbol.(formula), col_group)
+    B = length(_normalize_mlogit_rfx_corr(rfx_corr, terms))
 
     length(b0) == K || error("b0 has length $(length(b0)) but formula has $K variables")
     length(s0) == M || error("s0 has length $(length(s0)) but rfx has $M terms")
+    length(corr0) == B || error(
+        "corr0 has length $(length(corr0)) but rfx_corr has $B blocks")
     all(>(_RFX_SIGMA_FLOOR), s0) || error(
         "all s0 values must exceed the numerical sigma floor " *
         "$(_RFX_SIGMA_FLOOR)")
+    all(c -> isfinite(c) && abs(c) < _MLOGIT_RFX_CORR_LIMIT, corr0) || error(
+        "all corr0 values must be finite and strictly between " *
+        "$(-_MLOGIT_RFX_CORR_LIMIT) and $(_MLOGIT_RFX_CORR_LIMIT)")
 
-    th    = Float64[b0...; s0...]
-    terms = _normalize_mlogit_rfx(rfx, Symbol.(formula), col_group)
+    th = Float64[b0...; s0...; corr0...]
 
     # Translate level starts into the log scale for the lognormal families, so
     # that b0 means one thing (a level coefficient) whatever the mix of
@@ -1116,10 +1289,10 @@ function theta0_mlogit_rfx(formula, rfx;
 end
 
 """
-    theta0_mlogit_rfx_multistart(formula, rfx; b0, nstarts, s_range, b_jitter,
-                                 seed, col_group) -> Matrix
+    theta0_mlogit_rfx_multistart(formula, rfx; b0, nstarts, s_range, corr_range,
+                                 b_jitter, seed, rfx_corr, col_group) -> Matrix
 
-An `nstarts x (K + M)` matrix of starting values for [`mlogit_rfx`](@ref), **one
+An `nstarts x (K + M + B)` matrix of starting values for [`mlogit_rfx`](@ref), **one
 start per row**. The `mlogit_rfx` counterpart of
 [`theta0_rfx_multistart`](@ref); see that docstring for why `sigma` is drawn
 log-uniformly and why `b_jitter` is multiplicative.
@@ -1131,6 +1304,9 @@ function theta0_mlogit_rfx_multistart(formula, rfx;
                                       b0 = zeros(length(formula)),
                                       nstarts::Int = 100,
                                       s_range = (0.05, 2.0),
+                                      rfx_corr = [],
+                                      corr0 = fill(0.0, length(rfx_corr)),
+                                      corr_range = (-0.8, 0.8),
                                       b_jitter::Real = 0.0,
                                       seed::Int = 20260808,
                                       col_group::Symbol = :__group__)
@@ -1138,18 +1314,28 @@ function theta0_mlogit_rfx_multistart(formula, rfx;
     nstarts >= 1 || error("nstarts must be at least 1; got $nstarts")
     lo, hi = float(s_range[1]), float(s_range[2])
     (0 < lo && lo <= hi) || error("s_range must satisfy 0 < first <= last; got $s_range")
+    clo, chi = float(corr_range[1]), float(corr_range[2])
+    (-_MLOGIT_RFX_CORR_LIMIT < clo <= chi < _MLOGIT_RFX_CORR_LIMIT) || error(
+        "corr_range must lie strictly inside (-1, 1); got $corr_range")
     b_jitter >= 0 || error("b_jitter must be >= 0; got $b_jitter")
 
+    terms = _normalize_mlogit_rfx(rfx, Symbol.(formula), col_group)
+    B = length(_normalize_mlogit_rfx_corr(rfx_corr, terms))
+    length(corr0) == B || error(
+        "corr0 has length $(length(corr0)) but rfx_corr has $B blocks")
     K, M = length(formula), length(rfx)
     rng  = MersenneTwister(seed)
 
-    out = Matrix{Float64}(undef, nstarts, K + M)
-    out[1, :] .= theta0_mlogit_rfx(formula, rfx; b0 = b0, col_group = col_group)
+    out = Matrix{Float64}(undef, nstarts, K + M + B)
+    out[1, :] .= theta0_mlogit_rfx(formula, rfx; b0 = b0, rfx_corr = rfx_corr,
+                                   corr0 = corr0, col_group = col_group)
 
     for r in 2:nstarts
         s = exp.(log(lo) .+ (log(hi) - log(lo)) .* rand(rng, M))
+        c = B == 0 ? Float64[] : clo .+ (chi - clo) .* rand(rng, B)
         b = b_jitter > 0 ? collect(Float64, b0) .* exp.(b_jitter .* randn(rng, K)) : b0
         out[r, :] .= theta0_mlogit_rfx(formula, rfx; b0 = b, s0 = s,
+                                       rfx_corr = rfx_corr, corr0 = c,
                                        col_group = col_group)
     end
 
@@ -1159,19 +1345,27 @@ end
 """Validate `theta0` against a prepped model."""
 function _check_theta0_mlogit_rfx(theta0, P::MlogitRfxPrep)
     th   = Float64.(collect(theta0))
-    npar = P.K + P.M
+    npar = P.K + P.M + P.B
 
     length(th) == npar || error(
-        "theta0 has length $(length(th)) but the model has K + M = $(P.K) + $(P.M) = " *
-        "$npar parameters. Use theta0_mlogit_rfx(formula, rfx) to assemble it.")
+        "theta0 has length $(length(th)) but the model has K + M + B = $(P.K) + " *
+        "$(P.M) + $(P.B) = $npar parameters. Use " *
+        "theta0_mlogit_rfx(formula, rfx; rfx_corr = ...) to assemble it.")
 
-    if P.M > 0 && any(th[P.K+1:end] .< _RFX_SIGMA_FLOOR)
-        bad = findall(th[P.K+1:end] .< _RFX_SIGMA_FLOOR)
+    if P.M > 0 && any(th[P.K+1:P.K+P.M] .< _RFX_SIGMA_FLOOR)
+        bad = findall(th[P.K+1:P.K+P.M] .< _RFX_SIGMA_FLOOR)
         error("theta0 must have strictly positive sigma for rfx term(s) " *
               "$([P.terms[b].name for b in bad]); got $(th[P.K .+ bad]). Standard " *
               "deviations are constrained at or above the numerical floor " *
               "$(_RFX_SIGMA_FLOOR) during optimisation. Use a start " *
               "such as 0.5.")
+    end
+
+    if P.B > 0
+        c = view(th, P.K+P.M+1:npar)
+        all(x -> isfinite(x) && abs(x) < _MLOGIT_RFX_CORR_LIMIT, c) || error(
+            "theta0 correlations must be finite and strictly inside (-1, 1); got " *
+            "$(collect(c))")
     end
 
     return th
@@ -1184,11 +1378,11 @@ Normalise `theta0` to an `nstarts x npar` matrix and validate every row. Accepts
 plain vector (one start), a matrix with `npar` columns, or a vector of vectors.
 """
 function _mlogit_rfx_theta0_matrix(theta0, P::MlogitRfxPrep)
-    npar = P.K + P.M
+    npar = P.K + P.M + P.B
 
     if theta0 isa AbstractMatrix
         size(theta0, 2) == npar || error(
-            "theta0 has $(size(theta0, 2)) columns but the model has K + M = $npar " *
+            "theta0 has $(size(theta0, 2)) columns but the model has K + M + B = $npar " *
             "parameters. Multi-start theta0 is nstarts x npar: one start per ROW. " *
             "Build it with theta0_mlogit_rfx_multistart.")
         out = Matrix{Float64}(undef, size(theta0, 1), npar)
@@ -1237,7 +1431,7 @@ function _mlogit_rfx(
         optim_options::Optim.Options = Optim.Options();
         rethrow_errors::Bool = false)
 
-    npar = P.K + P.M
+    npar = P.K + P.M + P.B
 
     local myfit
     try
@@ -1245,16 +1439,16 @@ function _mlogit_rfx(
         theta_work = similar(theta0)
         grad_work  = similar(theta0)
         kernel = (F, G, theta) -> _mlogit_rfx_fg!(F, G, theta, P, buf, gw)
-        fg! = (F, G, phi) -> _rfx_positive_fg!(
-            F, G, phi, P.K, P.M, theta_work, grad_work, kernel)
+        fg! = (F, G, phi) -> _mlogit_rfx_unconstrained_fg!(
+            F, G, phi, P.K, P.M, P.B, theta_work, grad_work, kernel)
 
-        phi0 = _rfx_positive_start(theta0, P.K, P.M)
+        phi0 = _mlogit_rfx_unconstrained_start(theta0, P.K, P.M, P.B)
 
         time_it_took = @elapsed opt = optimize(
             Optim.only_fg!(fg!), phi0, LBFGS(), optim_options)
 
         th = similar(theta0)
-        _rfx_positive_theta!(th, Optim.minimizer(opt), P.K, P.M)
+        _mlogit_rfx_public_theta!(th, Optim.minimizer(opt), P.K, P.M, P.B)
 
         ess = P.M > 0 ? _mlogit_rfx_ess(th, P, buf) : fill(Float64(P.R), P.N)
 
@@ -1273,14 +1467,16 @@ function _mlogit_rfx(
             iteration_limit_reached = Optim.iteration_limit_reached(opt),
             time_it_took = time_it_took,
             extra = (; model = :mlogit_rfx,
-                       n_groups = P.N, K = P.K, M = P.M, R = P.R,
+                       n_groups = P.N, K = P.K, M = P.M, B = P.B, R = P.R,
                        col_id = P.col_group,          # the integration unit
                        col_set = P.col_id,            # the softmax group
                        n_sets = P.n_sets,
                        rfx = P.rfx_pairs, rfx_cols = P.rfx_cols,
                        rfx_terms = P.terms, cell_stats = P.cell_stats,
+                       rfx_corr = P.corr_pairs, corr_names = P.corr_names,
                        seed = P.seed,
                        sigma_parameterization = RFX_SIGMA_PARAMETERIZATION,
+                       corr_parameterization = MLOGIT_RFX_CORR_PARAMETERIZATION,
                        ess_min = minimum(ess), ess_p10 = quantile(ess, 0.10),
                        ess_median = median(ess), ess_mean = mean(ess),
                        Ti_min = minimum(Ti), Ti_median = median(Ti),
@@ -1400,8 +1596,10 @@ end
 """
     mlogit_rfx(data_df, formula, col_id, col_selected, theta0; kwargs...) -> MLEFit
 
-Multinomial (conditional) logit with independent random coefficients, estimated by
-maximum simulated likelihood with an analytic gradient.
+Multinomial (conditional) logit with random coefficients, estimated by maximum
+simulated likelihood with an analytic gradient. Coefficients are independent by
+default; `rfx_corr` can add disjoint bivariate correlation blocks for
+group-level normal coefficients.
 
 The positional arguments match [`mlogit`](@ref) exactly, so an existing `mlogit`
 call becomes an `mlogit_rfx` call by adding keywords. `rfx` and `col_group` are
@@ -1438,14 +1636,17 @@ holding "this row's alternative", so there is nothing for a level to point at.
 - `formula`: `Vector{Symbol}` of regressors, as in `mlogit`.
 - `col_id`: choice-set identifier. Must be unique across `col_group`.
 - `col_selected`: 0/1 column, exactly one 1 per choice set.
-- `theta0`: length `K + M` (see [`theta0_mlogit_rfx`](@ref)), or an
-  `nstarts x (K + M)` matrix -- one start per **row** -- for a multi-start fit.
+- `theta0`: length `K + M + B` (see [`theta0_mlogit_rfx`](@ref)), or an
+  `nstarts x (K + M + B)` matrix -- one start per **row** -- for a multi-start fit.
 
 # Keywords
 - `col_group = nothing`: integration unit. Defaults to `col_id`, i.e. one choice
   set per individual (the textbook cross-sectional mixed logit).
 - `rfx = []`: random-coefficient terms. `:x` and `:x => :lognormal` mean what they
   mean in `logit2_rfx`; [`rfx_term`](@ref) adds the level and the intercept form.
+- `rfx_corr = []`: disjoint pairs of group-level normal term names whose
+  coefficients are correlated, e.g. `[(:net_value, :training)]`. Each pair adds
+  one correlation parameter. Pair order is canonicalised to formula-term order.
 - `ndraws = 1000`: simulation draws, must be even (antithetic pairing).
 - `seed = 20260808`: draw seed. Draws are generated once and reused for every
   function evaluation, so the objective is a deterministic function of theta.
@@ -1456,12 +1657,12 @@ holding "this row's alternative", so there is nothing for a level to point at.
   `errored`/`error_message`; `true` lets the exception propagate.
 
 # Parameter ordering
-`theta = [mu (K, formula order); sigma (M, rfx order)]`, named
-`[formula...; "sd_" .* term names]`, where a term's name is `x` at the group level
-and `x|level` / `1|level` otherwise. Returned `sigma` is always `> 0`, enforced
-during optimisation through an internal softplus transformation. This keeps the
-fit in one identified orthant and makes the stored objective correspond exactly to
-the returned parameters even when finite draws are not componentwise sign-symmetric.
+`theta = [mu (K, formula order); sigma (M, rfx order); corr (B, block order)]`,
+named `[formula...; "sd_" .* term names; "cor_" .* block names]`, where a term's
+name is `x` at the group level and `x|level` / `1|level` otherwise. Returned
+`sigma` is always `> 0`, enforced through softplus; correlations stay strictly
+inside `(-1,1)` through a scaled `tanh`. This keeps the stored objective and
+public parameters on exactly the same constrained parameterisation.
 
 # What is *not* identified
 Three failures are checked in prep rather than left to produce a plausible number:
@@ -1509,6 +1710,7 @@ function mlogit_rfx(
         theta0;
         col_group = nothing,
         rfx = [],
+        rfx_corr = [],
         ndraws::Int = 1000,
         seed::Int = 20260808,
         weights::Union{Nothing, Symbol, String} = nothing,
@@ -1520,7 +1722,7 @@ function mlogit_rfx(
     cg  = isnothing(col_group) ? cid : Symbol(col_group)
 
     P, gw = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
-                             ndraws, seed, weights)
+                             ndraws, seed, weights, rfx_corr)
 
     theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
 

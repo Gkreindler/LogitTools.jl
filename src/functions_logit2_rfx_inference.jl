@@ -688,11 +688,20 @@ so all three numbers in a row describe the same quantity. `is_log_row` marks the
 transformed rows, because a Wald test against zero is vacuous there: `E[β]` and
 `SD[β]` are positive by construction under a lognormal.
 """
+function _rfx_sd_rows(fit::MLEFit, npar::Int, K::Int)
+    if !isnothing(fit.theta_names)
+        return startswith.(fit.theta_names, "sd_")
+    end
+    e = fit.extra
+    M = (!isnothing(e) && hasproperty(e, :M)) ? e.M : npar - K
+    return [K < j <= K + M for j in 1:npar]
+end
+
 function _rfx_table_stats(fit::MLEFit, ci_levels)
     npar = length(fit.theta_hat)
     e = fit.extra
     K = isnothing(e) ? npar : e.K
-    is_sd = [j > K for j in 1:npar]
+    is_sd = _rfx_sd_rows(fit, npar, K)
 
     meta = _rfx_log_meta(fit)          # nothing unless a lognormal rfx is present
 
@@ -1066,7 +1075,7 @@ function boot_report(fit::MLEFit; ci_levels = [2.5, 97.5], sd_tol = 1e-3)
     # which rows are sd_ parameters
     e = fit.extra
     K = isnothing(e) ? npar : e.K
-    is_sd = [j > K for j in 1:npar]
+    is_sd = _rfx_sd_rows(fit, npar, K)
 
     # ---- header block ------------------------------------------------------
     model = (!isnothing(e) && hasproperty(e, :model)) ? string(e.model) : "logit2_rfx"

@@ -24,7 +24,7 @@ Resampling choice sets would break the very factorisation the random effects rel
 on.
 
 # Keywords
-- `col_group`, `rfx`, `ndraws`, `seed`, `weights`, `optim_options`: as in
+- `col_group`, `rfx`, `rfx_corr`, `ndraws`, `seed`, `weights`, `optim_options`: as in
   [`mlogit_rfx`](@ref). Simulation draws are held fixed across replicates.
 - `nboot = 500`: number of bootstrap replicates.
 - `boot_seed = 12345`: seed for the Dirichlet weights. With the same `boot_seed`,
@@ -63,6 +63,7 @@ function boot_mlogit_rfx(
         theta0;
         col_group = nothing,
         rfx = [],
+        rfx_corr = [],
         ndraws::Int = 1000,
         seed::Int = 20260808,
         weights::Union{Nothing, Symbol, String} = nothing,
@@ -95,7 +96,7 @@ function boot_mlogit_rfx(
 
     # prep once, on the master
     P, gw_user = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
-                                  ndraws, seed, weights)
+                                  ndraws, seed, weights, rfx_corr)
 
     theta0s  = _mlogit_rfx_theta0_matrix(theta0, P)
     th_start = isnothing(theta_start) ? theta0s : _mlogit_rfx_theta0_matrix(theta_start, P)
@@ -127,7 +128,7 @@ function boot_mlogit_rfx(
         end
     end
 
-    return _assemble_rfx_boot(fits, P.K + P.M, nboot)
+    return _assemble_rfx_boot(fits, P.K + P.M + P.B, nboot)
 end
 
 

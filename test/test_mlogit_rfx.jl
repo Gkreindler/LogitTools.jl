@@ -28,11 +28,13 @@ effect needs in order to be identified.
 option-level random intercept on `:alt`.
 """
 function _mrfx_testdata(; N = 50, S = 4, J = 3, A = 4, seed = 13, ragged = false,
-                          beta = nothing, sigma_g = nothing, sigma_o = nothing)
+                          beta = nothing, sigma_g = nothing, sigma_o = nothing,
+                          sigma_net = nothing, sigma_v = nothing, rho = 0.0)
     rng = MersenneTwister(seed)
     rows = NamedTuple[]
     cid = 0
     nu = randn(rng, N)
+    nv = randn(rng, N)
     xi = randn(rng, N, A)
     for i in 1:N
         Si = ragged ? max(2, S - (i % 3)) : S
@@ -47,6 +49,7 @@ function _mrfx_testdata(; N = 50, S = 4, J = 3, A = 4, seed = 13, ragged = false
         end
     end
     df = DataFrame(rows)
+    df.xnet = df.x1 .+ df.x3
 
     v = zeros(nrow(df))
     if !isnothing(beta)
@@ -54,10 +57,23 @@ function _mrfx_testdata(; N = 50, S = 4, J = 3, A = 4, seed = 13, ragged = false
     end
     isnothing(sigma_g) || (v .+= sigma_g .* df.nu .* df.x1)
     isnothing(sigma_o) || (v .+= sigma_o .* df.xi)
+    if !isnothing(sigma_net) || !isnothing(sigma_v)
+        (!isnothing(sigma_net) && !isnothing(sigma_v)) || error(
+            "sigma_net and sigma_v must be supplied together")
+        abs(rho) < 1 || error("rho must be strictly inside (-1,1)")
+        for rg in groupby(df, :uniqueid)
+            i = first(rg.uniqueid)
+            a = sigma_net * nu[i]
+            vv = sigma_v * (rho * nu[i] + sqrt(1 - rho^2) * nv[i])
+            rows_i = parentindices(rg)[1]
+            v[rows_i] .+= a .* df.xnet[rows_i] .+ vv .* df.x2[rows_i]
+        end
+    end
 
     df.selected = zeros(Float64, nrow(df))
     for g in groupby(df, :setid)
-        if isnothing(beta) && isnothing(sigma_g) && isnothing(sigma_o)
+        if isnothing(beta) && isnothing(sigma_g) && isnothing(sigma_o) &&
+           isnothing(sigma_net) && isnothing(sigma_v)
             g.selected[rand(rng, 1:nrow(g))] = 1.0     # a valid 0/1 pattern is enough
         else
             g.selected[argmax(v[parentindices(g)[1]] .+ rand(rng, Gumbel(), nrow(g)))] = 1.0
@@ -128,6 +144,91 @@ end
                                                            Val{:central})
                 @test maximum(abs.(ga .- gn) ./ max.(1.0, abs.(gn))) < 1e-6
             end
+        end
+    end
+
+    # -----------------------------------------------------------------------
+    @testset "correlated person block: gradient and zero-correlation nesting" begin
+        df = _mrfx_testdata(N = 24, ragged = true)
+        rfx = [rfx_term(:xnet; mean = false), :x2,
+               rfx_term(level = :alt)]
+        rc = [(:xnet, :x2)]
+
+        Pc, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid,
+                                     rfx, 96, 20260808, nothing, rc)
+        gw = 0.3 .+ 1.5 .* rand(MersenneTwister(7), Pc.N)
+        @test Pc.B == 1
+        @test Pc.corr_pairs == [(1, 2)]
+        @test Pc.theta_names[end] == "cor_xnet__x2"
+        @test Pc.rfx_cols[1] == 0
+        @test Pc.zmatrix[:, 1] == df.xnet
+
+        for rho in (-0.55, 0.0, 0.45)
+            th = [0.4, -0.3, 0.2, 0.65, 0.8, 0.5, rho]
+            buf = LTR.MlogitRfxBuffers(Pc)
+            ga = _mrfx_grad(Pc, buf, gw, th)
+            gn = FiniteDiff.finite_difference_gradient(_mrfx_obj(Pc, buf, gw), th,
+                                                       Val{:central})
+            @test maximum(abs.(ga .- gn) ./ max.(1.0, abs.(gn))) < 2e-6
+
+            # Check the constrained optimiser-coordinate chain rule separately;
+            # a correct public gradient can still be wired incorrectly here.
+            phi = LTR._mlogit_rfx_unconstrained_start(th, Pc.K, Pc.M, Pc.B)
+            tw = similar(th); gt = similar(th)
+            kernel = (F, G, theta) -> LTR._mlogit_rfx_fg!(
+                F, G, theta, Pc, LTR.MlogitRfxBuffers(Pc), gw)
+            gphi = zeros(length(phi))
+            LTR._mlogit_rfx_unconstrained_fg!(true, gphi, phi, Pc.K, Pc.M, Pc.B,
+                                              tw, gt, kernel)
+            objphi = p -> LTR._mlogit_rfx_unconstrained_fg!(
+                true, nothing, collect(p), Pc.K, Pc.M, Pc.B, tw, gt, kernel)
+            gnphi = FiniteDiff.finite_difference_gradient(objphi, phi, Val{:central})
+            @test maximum(abs.(gphi .- gnphi) ./ max.(1.0, abs.(gnphi))) < 2e-6
+        end
+
+        # At rho = 0 the correlated construction must be the old independent
+        # model exactly, using the same cells and the same draws.
+        Pi, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid,
+                                     rfx, 96, 20260808, nothing)
+        @test Pi.eta == Pc.eta
+        thi = [0.4, -0.3, 0.2, 0.65, 0.8, 0.5]
+        thc = [thi; 0.0]
+        Gi = _mrfx_grad(Pi, LTR.MlogitRfxBuffers(Pi), gw, thi)
+        Gc = _mrfx_grad(Pc, LTR.MlogitRfxBuffers(Pc), gw, thc)
+        Qi = _mrfx_obj(Pi, LTR.MlogitRfxBuffers(Pi), gw)(thi)
+        Qc = _mrfx_obj(Pc, LTR.MlogitRfxBuffers(Pc), gw)(thc)
+        @test Qi == Qc
+        @test Gi == Gc[1:end-1]
+    end
+
+    # -----------------------------------------------------------------------
+    @testset "correlated person block: draw covariance and persistence" begin
+        df = _mrfx_testdata(N = 3)
+        rfx = [rfx_term(:xnet; mean = false), :x2,
+               rfx_term(level = :alt)]
+        Pc, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid,
+                                     rfx, 20_000, 19, nothing, [(:x2, :xnet)])
+
+        # Reversing the names is canonicalised, so finite draws do not change.
+        @test Pc.corr_pairs == [(1, 2)]
+        i = 1
+        crng = Pc.cell_ranges[i]
+        etai = view(Pc.eta, crng, :)
+        ct = view(Pc.cell_term, crng)
+        cc = view(Pc.corr_cells, i, :)
+        Ai = zeros(length(crng), Pc.R)
+        sigma = [0.7, 1.1, 0.4]
+        rho = -0.6
+        LTR._mlogit_rfx_fill_A!(Ai, zeros(Pc.K), sigma, [rho], etai, ct, cc, Pc)
+        cp, cq = cc[1], cc[2]
+        @test abs(std(view(Ai, cp, :)) - sigma[1]) < 0.02
+        @test abs(std(view(Ai, cq, :)) - sigma[2]) < 0.02
+        @test abs(cor(view(Ai, cp, :), view(Ai, cq, :)) - rho) < 0.02
+
+        # One group-level cell per person means the same two coefficient draws
+        # are reused across every one of that person's choice sets.
+        for rg in Pc.ranges, m in 1:2
+            @test length(unique(view(Pc.cellloc, rg, m))) == 1
         end
     end
 
@@ -432,6 +533,9 @@ end
         @test_throws ErrorException call([:x1 => :cauchy], th4)
         @test_throws ErrorException call([3.7], th4)
         @test_throws ErrorException call([(var = :x1, levl = :alt)], th4)
+        @test_throws ErrorException call([rfx_term(:xnet)], th4)
+        @test_throws ErrorException call(
+            [rfx_term(:xnet; mean = false, dist = :lognormal)], th4)
         @test_throws ErrorException call([rfx_term(level = :alt)], vcat(zeros(3), [0.0]))
         @test_throws ErrorException call([rfx_term(level = :alt)], zeros(3))
         @test_throws ErrorException mlogit_rfx(df, xs, :setid, :selected, th4;
@@ -475,6 +579,37 @@ end
         @test mlogit_rfx(d4, xs, :setid, :selected, th4;
                          col_group = :uniqueid, rfx = [rfx_term(level = :alt)],
                          weights = :wg, ndraws = 8).converged isa Bool
+
+        # Correlation blocks are named, normal, group-level, and disjoint.
+        crfx = [rfx_term(:xnet; mean = false), :x2]
+        cth  = [zeros(3); 0.5; 0.5; 0.0]
+        @test mlogit_rfx(df, _RXS, :setid, :selected, cth;
+                         col_group = :uniqueid, rfx = crfx,
+                         rfx_corr = [(:xnet, :x2)], ndraws = 8).converged isa Bool
+        for badcorr in ([(:nope, :x2)], [(:xnet, :xnet)], [(1, 2, 3)])
+            @test_throws ErrorException mlogit_rfx(
+                df, _RXS, :setid, :selected, cth;
+                col_group = :uniqueid, rfx = crfx, rfx_corr = badcorr, ndraws = 8)
+        end
+        @test_throws ErrorException mlogit_rfx(
+            df, _RXS, :setid, :selected, [zeros(3); fill(0.5, 3); 0.0];
+            col_group = :uniqueid,
+            rfx = [rfx_term(:xnet; mean = false), :x2,
+                   rfx_term(:x1; level = :alt)],
+            rfx_corr = [(:xnet, Symbol("x1|alt"))], ndraws = 8)
+        @test_throws ErrorException mlogit_rfx(
+            df, _RXS, :setid, :selected, [zeros(3); fill(0.5, 3); 0.0; 0.0];
+            col_group = :uniqueid,
+            rfx = [rfx_term(:xnet; mean = false), :x2, :x3],
+            rfx_corr = [(:xnet, :x2), (:x2, :x3)], ndraws = 8)
+        @test_throws ErrorException mlogit_rfx(
+            df, _RXS, :setid, :selected, cth;
+            col_group = :uniqueid, rfx = [:x1 => :lognormal, :x2],
+            rfx_corr = [(:x1, :x2)], ndraws = 8)
+        @test_throws ErrorException mlogit_rfx(
+            df, _RXS, :setid, :selected, [zeros(3); 0.5; 0.5; 1.0];
+            col_group = :uniqueid, rfx = crfx,
+            rfx_corr = [(:xnet, :x2)], ndraws = 8)
     end
 
     # -----------------------------------------------------------------------
@@ -504,6 +639,17 @@ end
         thn = theta0_mlogit_rfx(_RXS, [:x1 => :neg_lognormal]; b0 = [-2.0, 0.0, 0.0],
                                 s0 = [s0])
         @test thn[1] ≈ log(2.0) - s0^2 / 2
+
+        crfx = [rfx_term(:xnet; mean = false), :x2]
+        rc = [(:xnet, :x2)]
+        thc = theta0_mlogit_rfx(_RXS, crfx; b0 = [0.3, -0.2, 0.1],
+                                 s0 = [0.7, 0.9], rfx_corr = rc, corr0 = [-0.4],
+                                 col_group = :uniqueid)
+        @test thc == [0.3, -0.2, 0.1, 0.7, 0.9, -0.4]
+        @test_throws ErrorException theta0_mlogit_rfx(
+            _RXS, crfx; rfx_corr = rc, corr0 = Float64[], col_group = :uniqueid)
+        @test_throws ErrorException theta0_mlogit_rfx(
+            _RXS, crfx; rfx_corr = rc, corr0 = [1.0], col_group = :uniqueid)
     end
 
     # -----------------------------------------------------------------------
@@ -534,6 +680,35 @@ end
         qhat = LTR._mlogit_rfx_fg!(
             true, nothing, a.theta_hat, P, LTR.MlogitRfxBuffers(P), gw)
         @test a.obj_value ≈ qhat atol = 1e-9 rtol = 1e-12
+    end
+
+    # -----------------------------------------------------------------------
+    @testset "correlated fit determinism and stored objective" begin
+        df = _mrfx_testdata(N = 35)
+        rfx = [rfx_term(:xnet; mean = false), :x2,
+               rfx_term(level = :alt)]
+        rc = [(:xnet, :x2)]
+        th0 = theta0_mlogit_rfx(_RXS, rfx; rfx_corr = rc,
+                                 corr0 = [-0.25], col_group = :uniqueid)
+        a = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                       col_group = :uniqueid, rfx = rfx, rfx_corr = rc,
+                       ndraws = 64)
+        b = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                       col_group = :uniqueid, rfx = rfx,
+                       rfx_corr = [(:x2, :xnet)], ndraws = 64)
+        @test a.theta_hat == b.theta_hat
+        @test a.obj_value == b.obj_value
+        @test all(a.theta_hat[4:6] .> 0)
+        @test abs(a.theta_hat[7]) < 1
+
+        P, gw = LTR._prep_mlogit_rfx(
+            df, _RXS, :setid, :selected, :uniqueid, rfx, 64, 20260808,
+            nothing, rc)
+        qhat = LTR._mlogit_rfx_fg!(
+            true, nothing, a.theta_hat, P, LTR.MlogitRfxBuffers(P), gw)
+        @test a.obj_value ≈ qhat atol = 1e-9 rtol = 1e-12
+        @test a.extra.B == 1
+        @test a.extra.corr_parameterization === :scaled_tanh
     end
 
     # -----------------------------------------------------------------------
@@ -621,6 +796,47 @@ end
         @test occursin("sd_x1", s)
         @test occursin("sd_1|alt", s)
         @test occursin("[", s)                       # an interval was printed
+
+        # Correlation is bootstrapped and reported as a signed parameter, not
+        # misclassified as a nonnegative standard deviation.
+        crfx = [rfx_term(:xnet; mean = false), :x2,
+                rfx_term(level = :alt)]
+        rc = [(:xnet, :x2)]
+        cth0 = theta0_mlogit_rfx(_RXS, crfx; b0 = plain.theta_hat,
+                                  rfx_corr = rc, col_group = :uniqueid)
+        cfit = mlogit_rfx(df, _RXS, :setid, :selected, cth0;
+                          col_group = :uniqueid, rfx = crfx, rfx_corr = rc,
+                          ndraws = 64)
+        cfit.vcov = boot_mlogit_rfx(
+            df, _RXS, :setid, :selected, cth0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 64,
+            nboot = 8, parallel = false, theta_start = cfit.theta_hat)
+        @test size(cfit.vcov.theta_boot_table) == (8, 7)
+        @test all(abs.(cfit.vcov.theta_boot_table[:, 7]) .< 1)
+        crep = boot_report(cfit)
+        @test crep.param[end] == "cor_xnet__x2"
+        @test crep.is_sd == [false, false, false, true, true, true, false]
+        @test isnan(crep.share_near_zero[end])
+
+        # A matrix theta_start multi-starts every bootstrap replicate. This is
+        # the production escape hatch when a correlated specification has more
+        # than one basin: because row 1 is the single warm start, the selected
+        # objective can never be worse replicate by replicate.
+        cstarts = theta0_mlogit_rfx_multistart(
+            _RXS, crfx; b0 = plain.theta_hat, nstarts = 3,
+            rfx_corr = rc, col_group = :uniqueid, seed = 91)
+        one = boot_mlogit_rfx(
+            df, _RXS, :setid, :selected, cth0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 32,
+            nboot = 4, boot_seed = 77, parallel = false,
+            theta_start = vec(cstarts[1, :]))
+        many = boot_mlogit_rfx(
+            df, _RXS, :setid, :selected, cth0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 32,
+            nboot = 4, boot_seed = 77, parallel = false, theta_start = cstarts)
+        @test all(many.boot_fits[b].obj_value <= one.boot_fits[b].obj_value + 1e-10
+                  for b in 1:4)
+        @test all(many.boot_fits[b].extra.n_starts == 3 for b in 1:4)
     end
 
     # -----------------------------------------------------------------------
@@ -655,6 +871,24 @@ end
         @test_throws ErrorException mlogit_rfx(df, _RXS, :setid, :selected,
                                                zeros(3, 4); col_group = :uniqueid,
                                                rfx = rfx, ndraws = 8)
+
+        crfx = [rfx_term(:xnet; mean = false), :x2,
+                rfx_term(level = :alt)]
+        rc = [(:xnet, :x2)]
+        cth0 = theta0_mlogit_rfx(_RXS, crfx; b0 = plain.theta_hat,
+                                  rfx_corr = rc, corr0 = [-0.3],
+                                  col_group = :uniqueid)
+        cth0m = theta0_mlogit_rfx_multistart(
+            _RXS, crfx; b0 = plain.theta_hat, nstarts = 5,
+            rfx_corr = rc, corr0 = [-0.3], corr_range = (-0.6, 0.6),
+            col_group = :uniqueid, seed = 8)
+        @test size(cth0m) == (5, 7)
+        @test cth0m[1, :] == cth0
+        @test all(cth0m[:, 4:6] .> 0)
+        @test all(abs.(cth0m[:, 7]) .< 1)
+        @test_throws ErrorException theta0_mlogit_rfx_multistart(
+            _RXS, crfx; rfx_corr = rc, corr_range = (-1.0, 0.5),
+            col_group = :uniqueid)
     end
 
     # -----------------------------------------------------------------------
@@ -717,5 +951,35 @@ end
         @test maximum(abs.(fit.theta_hat[4:5] .- [0.7, 0.9])) < 0.2
         # ignoring the random effect attenuates the slope towards zero
         @test abs(plain.theta_hat[1] - 0.8) > abs(fit.theta_hat[1] - 0.8)
+    end
+
+    # -----------------------------------------------------------------------
+    @testset "correlated person and option-effect recovery (slow)" begin
+        truth_b = [0.7, -0.45, 0.25]
+        truth_s = [0.65, 0.85, 0.55]
+        truth_rho = -0.45
+        df = _mrfx_testdata(N = 500, S = 8, J = 4, A = 6, seed = 90210,
+                            beta = truth_b, sigma_net = truth_s[1],
+                            sigma_v = truth_s[2], rho = truth_rho,
+                            sigma_o = truth_s[3])
+        opts = Optim.Options(iterations = 5_000, g_tol = 1e-6)
+        rfx = [rfx_term(:xnet; mean = false), :x2,
+               rfx_term(level = :alt)]
+        rc = [(:xnet, :x2)]
+
+        plain = mlogit(df, _RXS, :setid, :selected, zeros(3);
+                       optim_options = opts)
+        th0 = theta0_mlogit_rfx(_RXS, rfx; b0 = plain.theta_hat,
+                                 rfx_corr = rc, corr0 = [0.0],
+                                 col_group = :uniqueid)
+        fit = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                         col_group = :uniqueid, rfx = rfx, rfx_corr = rc,
+                         ndraws = 600, optim_options = opts)
+
+        @test fit.converged
+        @test maximum(abs.(fit.theta_hat[1:3] .- truth_b)) < 0.18
+        @test maximum(abs.(fit.theta_hat[4:6] .- truth_s)) < 0.22
+        @test abs(fit.theta_hat[7] - truth_rho) < 0.25
+        @test sign(fit.theta_hat[7]) == sign(truth_rho)
     end
 end
