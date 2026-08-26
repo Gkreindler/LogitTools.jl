@@ -925,8 +925,16 @@ end
             vp = boot_mlogit_rfx(df, _RXS, :setid, :selected, th0;
                                  col_group = :uniqueid, rfx = rfx, ndraws = 32,
                                  nboot = 8, boot_seed = 4242, parallel = true)
+            # A second distributed call in the same process exercises the
+            # scoped CachingPool cleanup. Large production preps must not leave
+            # stale closures resident on workers between stages.
+            vp2 = boot_mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                                  col_group = :uniqueid, rfx = rfx, ndraws = 32,
+                                  nboot = 8, boot_seed = 4242, parallel = true)
             @test vs.theta_boot_table == vp.theta_boot_table
             @test vs.V == vp.V
+            @test vp.theta_boot_table == vp2.theta_boot_table
+            @test vp.V == vp2.V
         end
     end
 

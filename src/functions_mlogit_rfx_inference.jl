@@ -120,7 +120,16 @@ function boot_mlogit_rfx(
     end
 
     fits = if parallel
-        pmap(task, CachingPool(workers()), 1:nboot)
+        # P can be very large at the draw counts used by mlogit_rfx. Keep one
+        # cached copy per worker for this bootstrap, then release it explicitly
+        # so a caller can continue with another large distributed stage in the
+        # same Julia process without retaining the whole simulation array.
+        pool = CachingPool(workers())
+        try
+            pmap(task, pool, 1:nboot)
+        finally
+            clear!(pool)
+        end
     else
         map(1:nboot) do b
             mydebug && println("bootstrapping mlogit_rfx, replicate=", b)
