@@ -837,6 +837,36 @@ end
         @test all(many.boot_fits[b].obj_value <= one.boot_fits[b].obj_value + 1e-10
                   for b in 1:4)
         @test all(many.boot_fits[b].extra.n_starts == 3 for b in 1:4)
+
+        # A cube supplies a different start matrix to each replicate. Repeating
+        # the shared matrix must be exactly backward-compatible, and selecting
+        # deterministic bootstrap indices must reproduce the corresponding full
+        # run rows in the requested order.
+        cube = repeat(reshape(cstarts, size(cstarts, 1), size(cstarts, 2), 1),
+                      1, 1, 4)
+        byboot = boot_mlogit_rfx(
+            df, _RXS, :setid, :selected, cth0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 32,
+            nboot = 4, boot_seed = 77, parallel = false, theta_start = cube)
+        @test byboot.theta_boot_table == many.theta_boot_table
+        @test [f.obj_value for f in byboot.boot_fits] ==
+              [f.obj_value for f in many.boot_fits]
+
+        subset = boot_mlogit_rfx(
+            df, _RXS, :setid, :selected, cth0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 32,
+            nboot = 4, boot_seed = 77, parallel = false, theta_start = cube,
+            boot_indices = [4, 2])
+        @test subset.theta_boot_table == byboot.theta_boot_table[[4, 2], :]
+        @test_throws ErrorException boot_mlogit_rfx(
+            df, _RXS, :setid, :selected, cth0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 8,
+            nboot = 4, parallel = false, theta_start = cube[:, :, 1:3])
+        @test_throws ErrorException boot_mlogit_rfx(
+            df, _RXS, :setid, :selected, cth0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 8,
+            nboot = 4, parallel = false, theta_start = cube,
+            boot_indices = [2, 2])
     end
 
     # -----------------------------------------------------------------------

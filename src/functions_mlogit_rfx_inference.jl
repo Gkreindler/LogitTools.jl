@@ -39,7 +39,14 @@ on.
   optimum kept -- `nstarts` times the runtime, and the right call when the
   specification has local optima, because a single warm start hands every
   replicate the point estimate's basin instead of the one its own resample
-  prefers.
+  prefers. A three-dimensional `nstarts x npar x nboot` array supplies a
+  different start matrix for each bootstrap replicate; this is useful when a
+  cheap preliminary fit can update high-dimensional fixed effects under that
+  replicate's exact weights.
+- `boot_indices = nothing`: estimate all `1:nboot` replicates. Passing a unique
+  subset estimates those columns of the deterministic `nboot`-replicate weight
+  matrix and returns them in the requested order. This supports atomic external
+  batching/checkpointing without changing any bootstrap weights.
 - `rethrow_errors = false`: by default a replicate that throws is captured as
   `errored` and the run continues. When replicates are failing, re-run with
   `parallel = false, nboot = 2, rethrow_errors = true` for a readable error.
@@ -72,6 +79,7 @@ function boot_mlogit_rfx(
         cluster_var = nothing,
         parallel::Bool = true,
         theta_start = nothing,
+        boot_indices = nothing,
         optim_options::Optim.Options = Optim.Options(),
         rethrow_errors::Bool = false,
         mydebug::Bool = false)
@@ -98,9 +106,23 @@ function boot_mlogit_rfx(
     P, gw_user = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
                                   ndraws, seed, weights, rfx_corr)
 
-    theta0s  = _mlogit_rfx_theta0_matrix(theta0, P)
-    th_start = isnothing(theta_start) ? theta0s : _mlogit_rfx_theta0_matrix(theta_start, P)
-    nstart   = size(th_start, 1)
+    theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
+    per_boot_starts = theta_start isa AbstractArray && ndims(theta_start) == 3
+    th_start = if per_boot_starts
+        _mlogit_rfx_theta0_cube(theta_start, P, nboot)
+    else
+        isnothing(theta_start) ? theta0s : _mlogit_rfx_theta0_matrix(theta_start, P)
+    end
+    nstart = size(th_start, 1)
+
+    boot_ids = isnothing(boot_indices) ? collect(1:nboot) :
+               Int.(collect(boot_indices))
+    length(boot_ids) >= 2 || error(
+        "boot_indices must select at least two replicates so a covariance can " *
+        "be computed; got $boot_ids")
+    all(b -> 1 <= b <= nboot, boot_ids) || error(
+        "boot_indices must lie in 1:$nboot; got $boot_ids")
+    allunique(boot_ids) || error("boot_indices must be unique; got $boot_ids")
 
     # group-level Dirichlet weights, and the user's weights on top of them
     W     = _rfx_boot_weights(P.N, nboot, boot_seed)
@@ -108,7 +130,17 @@ function boot_mlogit_rfx(
 
     # With several starts per replicate the inner fit must run SERIALLY: the outer
     # pmap already owns every worker, and nesting would deadlock on the same pool.
-    task = if nstart == 1
+    task = if per_boot_starts && nstart == 1
+        b -> _mlogit_rfx(P, Vector{Float64}(view(th_start, 1, :, b)),
+                         Vector{Float64}(view(Wfull, :, b)), optim_options;
+                         rethrow_errors = rethrow_errors)
+    elseif per_boot_starts
+        b -> _mlogit_rfx_multi(P, view(th_start, :, :, b),
+                               Vector{Float64}(view(Wfull, :, b)),
+                               optim_options; parallel = false,
+                               rethrow_errors = rethrow_errors,
+                               warn_multi = false)
+    elseif nstart == 1
         ths = vec(th_start)
         b -> _mlogit_rfx(P, ths, Vector{Float64}(view(Wfull, :, b)), optim_options;
                          rethrow_errors = rethrow_errors)
@@ -126,18 +158,18 @@ function boot_mlogit_rfx(
         # same Julia process without retaining the whole simulation array.
         pool = CachingPool(workers())
         try
-            pmap(task, pool, 1:nboot)
+            pmap(task, pool, boot_ids)
         finally
             clear!(pool)
         end
     else
-        map(1:nboot) do b
+        map(boot_ids) do b
             mydebug && println("bootstrapping mlogit_rfx, replicate=", b)
             task(b)
         end
     end
 
-    return _assemble_rfx_boot(fits, P.K + P.M + P.B, nboot)
+    return _assemble_rfx_boot(fits, P.K + P.M + P.B, length(boot_ids))
 end
 
 

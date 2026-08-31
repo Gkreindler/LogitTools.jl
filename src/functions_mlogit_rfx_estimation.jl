@@ -1403,6 +1403,33 @@ function _mlogit_rfx_theta0_matrix(theta0, P::MlogitRfxPrep)
     return reshape(_check_theta0_mlogit_rfx(theta0, P), 1, npar)
 end
 
+"""
+    _mlogit_rfx_theta0_cube(theta0, P, nboot) -> Array{Float64,3}
+
+Validate replicate-specific bootstrap starts. The dimensions are
+`nstarts × npar × nboot`: every `theta0[:, :, b]` is the ordinary start matrix
+for bootstrap replicate `b`. Keeping the existing matrix dimensions first makes
+each replicate's slice contiguous and preserves the row-per-start convention of
+[`_mlogit_rfx_theta0_matrix`](@ref).
+"""
+function _mlogit_rfx_theta0_cube(theta0::AbstractArray{<:Real,3},
+                                 P::MlogitRfxPrep, nboot::Int)
+    size(theta0, 1) >= 1 || error(
+        "replicate-specific theta_start must contain at least one start")
+    size(theta0, 2) == P.K + P.M + P.B || error(
+        "replicate-specific theta_start has $(size(theta0, 2)) parameters but " *
+        "the model has K + M + B = $(P.K + P.M + P.B)")
+    size(theta0, 3) == nboot || error(
+        "replicate-specific theta_start has $(size(theta0, 3)) bootstrap slices " *
+        "but nboot=$nboot")
+
+    out = Array{Float64,3}(undef, size(theta0))
+    for b in 1:nboot
+        out[:, :, b] .= _mlogit_rfx_theta0_matrix(view(theta0, :, :, b), P)
+    end
+    return out
+end
+
 
 # ----------------------------------------------------------------------------
 # Estimation
