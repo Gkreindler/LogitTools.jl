@@ -858,6 +858,20 @@ end
             nboot = 4, boot_seed = 77, parallel = false, theta_start = cube,
             boot_indices = [4, 2])
         @test subset.theta_boot_table == byboot.theta_boot_table[[4, 2], :]
+
+        # A streaming callback observes every completed fit with its global
+        # replicate id, without changing result order or numerical output.
+        callback_rows = Pair{Int,Float64}[]
+        callback_subset = boot_mlogit_rfx(
+            df, _RXS, :setid, :selected, cth0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 32,
+            nboot = 4, boot_seed = 77, parallel = false, theta_start = cube,
+            boot_indices = [4, 2],
+            on_fit = (b, f) -> push!(callback_rows, b => f.obj_value))
+        @test callback_subset.theta_boot_table == subset.theta_boot_table
+        @test first.(callback_rows) == [4, 2]
+        @test last.(callback_rows) == [f.obj_value for f in subset.boot_fits]
+
         @test_throws ErrorException boot_mlogit_rfx(
             df, _RXS, :setid, :selected, cth0;
             col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 8,
@@ -961,10 +975,41 @@ end
             vp2 = boot_mlogit_rfx(df, _RXS, :setid, :selected, th0;
                                   col_group = :uniqueid, rfx = rfx, ndraws = 32,
                                   nboot = 8, boot_seed = 4242, parallel = true)
+            callback_rows = Pair{Int,Float64}[]
+            vps = boot_mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                                  col_group = :uniqueid, rfx = rfx, ndraws = 32,
+                                  nboot = 8, boot_seed = 4242, parallel = true,
+                                  on_fit = (b, f) ->
+                                      push!(callback_rows, b => f.obj_value))
             @test vs.theta_boot_table == vp.theta_boot_table
             @test vs.V == vp.V
             @test vp.theta_boot_table == vp2.theta_boot_table
             @test vp.V == vp2.V
+            @test vps.theta_boot_table == vp.theta_boot_table
+            @test sort(first.(callback_rows)) == collect(1:8)
+            @test Dict(callback_rows) ==
+                  Dict(b => vp.boot_fits[b].obj_value for b in 1:8)
+
+            # Deliberately make id 1 slow. The other worker must pull more work
+            # instead of waiting at a one-task-per-worker barrier, and the
+            # returned vector must nevertheless retain id order.
+            pool = CachingPool(workers())
+            completion_order = Int[]
+            try
+                worker_for_id = LTR._pmap_rfx_streaming(
+                    b -> begin
+                        sleep(b == 1 ? 0.5 : 0.02)
+                        (id = b, worker = myid())
+                    end,
+                    pool, collect(1:6),
+                    (b, _) -> push!(completion_order, b))
+                @test getproperty.(worker_for_id, :id) == collect(1:6)
+                @test completion_order[end] == 1
+                @test maximum(values(countmap(getproperty.(worker_for_id,
+                                                            :worker)))) >= 4
+            finally
+                clear!(pool)
+            end
         end
     end
 

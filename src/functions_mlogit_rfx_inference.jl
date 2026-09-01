@@ -14,6 +14,31 @@
 ###############################################################################
 
 """
+    _pmap_rfx_streaming(task, pool, ids, on_fit) -> Vector
+
+Run one remote call per id while keeping the worker pool continuously fed. The
+returned vector follows `ids` order, while `on_fit(id, fit)` runs on the master
+in completion order. The callback is serialized behind a lock so callers can
+atomically update a shared checkpoint without holding a worker idle: a worker is
+returned to `pool` by `remotecall_fetch` before its callback begins.
+"""
+function _pmap_rfx_streaming(task, pool::AbstractWorkerPool,
+                             ids::AbstractVector{<:Integer}, on_fit)
+    fits = Vector{Any}(undef, length(ids))
+    callback_lock = ReentrantLock()
+    @sync for (j, b) in enumerate(ids)
+        @async begin
+            fit = remotecall_fetch(task, pool, b)
+            fits[j] = fit
+            lock(callback_lock) do
+                on_fit(b, fit)
+            end
+        end
+    end
+    return fits
+end
+
+"""
     boot_mlogit_rfx(data_df, formula, col_id, col_selected, theta0; kwargs...) -> MLEvcov
 
 Bayesian bootstrap for [`mlogit_rfx`](@ref), resampling at the `col_group` level.
@@ -47,6 +72,11 @@ on.
   subset estimates those columns of the deterministic `nboot`-replicate weight
   matrix and returns them in the requested order. This supports atomic external
   batching/checkpointing without changing any bootstrap weights.
+- `on_fit = nothing`: optional master-process callback `on_fit(replicate, fit)`.
+  In parallel mode it runs as soon as each replicate completes, while the freed
+  worker immediately takes the next pending replicate. This permits streaming
+  atomic checkpoints without wave barriers. The returned bootstrap table still
+  follows `boot_indices` order, independent of completion order.
 - `rethrow_errors = false`: by default a replicate that throws is captured as
   `errored` and the run continues. When replicates are failing, re-run with
   `parallel = false, nboot = 2, rethrow_errors = true` for a readable error.
@@ -80,6 +110,7 @@ function boot_mlogit_rfx(
         parallel::Bool = true,
         theta_start = nothing,
         boot_indices = nothing,
+        on_fit = nothing,
         optim_options::Optim.Options = Optim.Options(),
         rethrow_errors::Bool = false,
         mydebug::Bool = false)
@@ -158,14 +189,17 @@ function boot_mlogit_rfx(
         # same Julia process without retaining the whole simulation array.
         pool = CachingPool(workers())
         try
-            pmap(task, pool, boot_ids)
+            isnothing(on_fit) ? pmap(task, pool, boot_ids) :
+                _pmap_rfx_streaming(task, pool, boot_ids, on_fit)
         finally
             clear!(pool)
         end
     else
         map(boot_ids) do b
             mydebug && println("bootstrapping mlogit_rfx, replicate=", b)
-            task(b)
+            fit = task(b)
+            !isnothing(on_fit) && on_fit(b, fit)
+            fit
         end
     end
 
