@@ -1097,4 +1097,128 @@ end
         @test abs(fit.theta_hat[7] - truth_rho) < 0.25
         @test sign(fit.theta_hat[7]) == sign(truth_rho)
     end
+
+    # -----------------------------------------------------------------------
+    @testset "kernel modes: :binary and :binary_antithetic_simd match :general" begin
+        # Two-option panels with option-level effects, a mean-free loading, a
+        # correlated person block, ragged panels, a person with one choice set,
+        # weights, and utilities pushed far from zero. Every mode computes the
+        # same likelihood; agreement is to roundoff, not bit for bit.
+        df = _mrfx_testdata(N = 30, S = 5, J = 2, A = 4, ragged = true, seed = 21)
+        first3 = minimum(df.setid[df.uniqueid .== 3])
+        df = df[.!((df.uniqueid .== 3) .& (df.setid .> first3)), :]
+        df.x3 .*= 40.0
+        rfx = [rfx_term(:xnet; mean = false), :x2,
+               rfx_term(level = :alt), rfx_term(:x1; level = :alt)]
+        rc  = [(:xnet, :x2)]
+        prep(mode) = first(LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid,
+                                                rfx, 64, 20260808, nothing, rc; kernel = mode))
+        Pg = prep(:general); Pb = prep(:binary); Ps = prep(:binary_antithetic_simd)
+        Pa = prep(:auto)
+        @test Pa.kernel === :binary_antithetic_simd
+        @test Pg.kernel === :general && Pb.kernel === :binary
+        @test Pb.binary && Ps.binary && Pg.binary       # eligibility is a data fact
+        @test Pg.eta == Ps.eta                           # same draws, same seed
+        @test Ps.etaT == permutedims(Ps.eta[:, 1:Ps.H])
+        @test isempty(Pg.nz_z) && isempty(Pb.set_dz) && !isempty(Ps.set_dz)
+        @test minimum(length.(Pg.set_of_group)) == 1     # the one-set person survived
+
+        gw = 0.3 .+ 1.5 .* rand(MersenneTwister(4), Pg.N)
+        K, M, B = Pg.K, Pg.M, Pg.B
+        thetas = [[0.4, -0.3, 0.02, 0.65, 0.8, 0.5, 0.7, -0.55],
+                  [0.4, -0.3, 0.02, 1e-7, 0.8, 1e-7, 0.7, 0.0],       # near-zero sigmas
+                  [-1.2, 0.9, 0.05, 0.3, 0.2, 1.5, 0.1, 0.9999]]      # rho at the limit
+        for th in thetas, w in (nothing, gw)
+            Gg = zeros(K+M+B); Gb = zeros(K+M+B); Gs = zeros(K+M+B)
+            Qg = LTR._mlogit_rfx_fg!(true, Gg, th, Pg, LTR.MlogitRfxBuffers(Pg), w)
+            Qb = LTR._mlogit_rfx_fg!(true, Gb, th, Pb, LTR.MlogitRfxBuffers(Pb), w)
+            Qs = LTR._mlogit_rfx_fg!(true, Gs, th, Ps, LTR.MlogitRfxBuffers(Ps), w)
+            @test abs(Qb - Qg) <= 1e-10 * abs(Qg)
+            @test abs(Qs - Qg) <= 1e-10 * abs(Qg)
+            @test maximum(abs.(Gb .- Gg) ./ max.(1.0, abs.(Gg))) < 1e-10
+            @test maximum(abs.(Gs .- Gg) ./ max.(1.0, abs.(Gg))) < 1e-10
+            # objective-only call returns the same number as the fused call
+            @test LTR._mlogit_rfx_fg!(true, nothing, th, Ps, LTR.MlogitRfxBuffers(Ps), w) == Qs
+            @test LTR._mlogit_rfx_fg!(true, nothing, th, Pb, LTR.MlogitRfxBuffers(Pb), w) == Qb
+            eg = LTR._mlogit_rfx_ess(th, Pg, LTR.MlogitRfxBuffers(Pg))
+            @test maximum(abs.(LTR._mlogit_rfx_ess(th, Pb, LTR.MlogitRfxBuffers(Pb)) .- eg) ./ eg) < 1e-10
+            @test maximum(abs.(LTR._mlogit_rfx_ess(th, Ps, LTR.MlogitRfxBuffers(Ps)) .- eg) ./ eg) < 1e-10
+        end
+
+        # the simd gradient against finite differences of its own objective,
+        # including the correlation derivative
+        th = thetas[1]
+        bufs = LTR.MlogitRfxBuffers(Ps)
+        Gs = zeros(K+M+B); LTR._mlogit_rfx_fg!(true, Gs, th, Ps, bufs, gw)
+        gn = FiniteDiff.finite_difference_gradient(
+            t -> LTR._mlogit_rfx_fg!(true, nothing, collect(Float64, t), Ps, bufs, gw),
+            th, Val{:central})
+        @test maximum(abs.(Gs .- gn) ./ max.(1.0, abs.(gn))) < 1e-6
+
+        # eligibility: J = 3 sets are not binary; a lognormal term excludes simd
+        df3 = _mrfx_testdata(N = 12, J = 3)
+        P3, _ = LTR._prep_mlogit_rfx(df3, _RXS, :setid, :selected, :uniqueid, [:x1], 16, 1, nothing)
+        @test P3.kernel === :general && !P3.binary
+        @test_throws ErrorException LTR._prep_mlogit_rfx(
+            df3, _RXS, :setid, :selected, :uniqueid, [:x1], 16, 1, nothing; kernel = :binary)
+        lrfx = [:x1 => :lognormal, rfx_term(level = :alt)]
+        Pl, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, lrfx, 16, 1, nothing)
+        @test Pl.kernel === :binary
+        @test_throws ErrorException LTR._prep_mlogit_rfx(
+            df, _RXS, :setid, :selected, :uniqueid, lrfx, 16, 1, nothing;
+            kernel = :binary_antithetic_simd)
+        Plg, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, lrfx, 16, 1, nothing;
+                                      kernel = :general)
+        thl = [0.2, -0.3, 0.02, 0.5, 0.4]
+        Gl = zeros(5); Glg = zeros(5)
+        Ql  = LTR._mlogit_rfx_fg!(true, Gl,  thl, Pl,  LTR.MlogitRfxBuffers(Pl),  nothing)
+        Qlg = LTR._mlogit_rfx_fg!(true, Glg, thl, Plg, LTR.MlogitRfxBuffers(Plg), nothing)
+        @test abs(Ql - Qlg) <= 1e-10 * abs(Qlg)
+        @test maximum(abs.(Gl .- Glg) ./ max.(1.0, abs.(Glg))) < 1e-10
+        # M = 0 resolves to :binary
+        P0, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, [], 8, 1, nothing)
+        @test P0.kernel === :binary
+        @test_throws ErrorException LTR._prep_mlogit_rfx(
+            df, _RXS, :setid, :selected, :uniqueid, [], 8, 1, nothing;
+            kernel = :binary_antithetic_simd)
+        @test_throws ErrorException LTR._prep_mlogit_rfx(
+            df, _RXS, :setid, :selected, :uniqueid, [:x1], 8, 1, nothing; kernel = :nope)
+
+        # public API: same fit under every kernel, keyword recorded; BFGS
+        # reaches the same optimum as LBFGS
+        plain = mlogit(df, _RXS, :setid, :selected, zeros(3))
+        th0 = theta0_mlogit_rfx(_RXS, rfx; b0 = plain.theta_hat, rfx_corr = rc,
+                                col_group = :uniqueid)
+        tight = Optim.Options(g_tol = 1e-8, iterations = 5000)
+        fits = Dict(mode => mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                                       col_group = :uniqueid, rfx = rfx, rfx_corr = rc,
+                                       ndraws = 64, kernel = mode, optim_options = tight)
+                    for mode in (:general, :binary, :binary_antithetic_simd))
+        @test all(f.converged for f in values(fits))
+        @test fits[:general].extra.kernel === :general
+        @test fits[:binary_antithetic_simd].extra.kernel === :binary_antithetic_simd
+        for mode in (:binary, :binary_antithetic_simd)
+            @test abs(fits[mode].obj_value - fits[:general].obj_value) < 1e-6
+            @test maximum(abs.(fits[mode].theta_hat .- fits[:general].theta_hat)) < 1e-4
+        end
+        fb = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                        col_group = :uniqueid, rfx = rfx, rfx_corr = rc, ndraws = 64,
+                        optimizer = BFGS(), optim_options = tight)
+        @test fb.converged
+        @test abs(fb.obj_value - fits[:general].obj_value) < 1e-6
+        @test occursin("BFGS", fb.extra.optimizer)
+
+        # one bootstrap replicate through the single-replicate API, both kernels
+        rg = fit_mlogit_rfx_bootstrap_replicate(
+            df, _RXS, :setid, :selected, th0, 2; col_group = :uniqueid, rfx = rfx,
+            rfx_corr = rc, ndraws = 32, nboot = 4, boot_seed = 77, kernel = :general,
+            theta_start = fits[:general].theta_hat, optim_options = tight)
+        rs = fit_mlogit_rfx_bootstrap_replicate(
+            df, _RXS, :setid, :selected, th0, 2; col_group = :uniqueid, rfx = rfx,
+            rfx_corr = rc, ndraws = 32, nboot = 4, boot_seed = 77,
+            theta_start = fits[:general].theta_hat, optim_options = tight)
+        @test rs.extra.kernel === :binary_antithetic_simd
+        @test rg.weights == rs.weights
+        @test abs(rg.obj_value - rs.obj_value) < 1e-6
+    end
 end

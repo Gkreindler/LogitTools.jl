@@ -363,7 +363,24 @@ struct MlogitRfxPrep
     seed::Int
     n_sets::Int
     cell_stats::Vector{NamedTuple}         # per-term identification diagnostics
+    kernel::Symbol                         # resolved kernel mode, see _MLOGIT_RFX_KERNELS
+    binary::Bool                           # every choice set has exactly two rows
+    nz_ptr::Vector{Int}                    # Nobs+1, CSR row pointers into nz_loc / nz_z
+    nz_loc::Vector{Int}                    # group-local cell of each nonzero loading
+    nz_z::Vector{Float64}                  # the nonzero loading values, in term order
+    # --- :binary_antithetic_simd only (empty otherwise) ---------------------
+    H::Int                                 # R/2, number of antithetic pairs
+    set_ptr::Vector{Int}                   # n_sets+1, pointers into set_loc / set_dz
+    set_loc::Vector{Int}                   # group-local cell of each merged signed loading
+    set_dz::Vector{Float64}                # z(first row) - z(second row), merged per cell
+    dX::Matrix{Float64}                    # n_sets x K, xlin(first row) - xlin(second row)
+    ysel::Vector{Bool}                     # n_sets, is the FIRST row the selected one
+    etaT::Matrix{Float64}                  # H x ncells, first half of eta transposed
+    Smax::Int                              # max choice sets per group
 end
+
+"""Kernel modes accepted by `mlogit_rfx`'s `kernel` keyword."""
+const _MLOGIT_RFX_KERNELS = (:auto, :general, :binary, :binary_antithetic_simd)
 
 """
     _contiguous_blocks(v) -> Vector{UnitRange{Int}}
@@ -404,7 +421,11 @@ function _prep_mlogit_rfx(
         ndraws::Int,
         seed::Int,
         weights::Union{Nothing, Symbol, String},
-        rfx_corr = [])
+        rfx_corr = [];
+        kernel::Symbol = :auto)
+
+    kernel in _MLOGIT_RFX_KERNELS || error(
+        "kernel must be one of $(_MLOGIT_RFX_KERNELS); got :$kernel")
 
     formula_syms = Symbol.(formula)
     K = length(formula_syms)
@@ -622,6 +643,85 @@ function _prep_mlogit_rfx(
     theta_names = [string.(formula_syms); ["sd_" * t.name for t in terms]; corr_names]
     rfx_pairs   = Pair{Symbol,Symbol}[Symbol(t.name) => t.dist for t in terms]
 
+    # --- kernel mode ---------------------------------------------------------
+    # :general                 any choice-set size, any distribution (reference)
+    # :binary                  every set has two rows: logistic softmax, and a
+    #                          per-row list of the NONZERO loadings; normal and
+    #                          lognormal terms
+    # :binary_antithetic_simd  two rows AND all-normal terms: the second half
+    #                          of the antithetic draws is the negative of the
+    #                          first, so the random part of the utility
+    #                          difference is computed once per pair; draws are
+    #                          stored contiguously so the inner loops vectorise
+    # :auto picks the most specialised eligible mode. Asking for an ineligible
+    # mode is an error rather than a silent fallback.
+    binary  = n_sets > 0 && all(sr -> length(sr) == 2, set_ranges)
+    simd_ok = binary && M > 0 && !any_log
+    mode = if kernel === :auto
+        simd_ok ? :binary_antithetic_simd : binary ? :binary : :general
+    else
+        kernel === :binary && !binary && error(
+            "kernel = :binary needs every choice set to have exactly two rows")
+        kernel === :binary_antithetic_simd && !simd_ok && error(
+            "kernel = :binary_antithetic_simd needs two-row choice sets, at least one " *
+            "random term, and no lognormal term (its sign symmetry is what the " *
+            "antithetic pairing exploits)")
+        kernel
+    end
+
+    nz_ptr = ones(Int, Nobs + 1)
+    nz_loc = Int[]
+    nz_z   = Float64[]
+    if mode !== :general
+        for t in 1:Nobs
+            for m in 1:M
+                z = zmatrix[t, m]
+                z == 0.0 && continue
+                push!(nz_loc, cellloc[t, m])
+                push!(nz_z, z)
+            end
+            nz_ptr[t + 1] = length(nz_loc) + 1
+        end
+    end
+
+    H = ndraws ÷ 2
+    set_ptr = ones(Int, n_sets + 1)
+    set_loc = Int[]
+    set_dz  = Float64[]
+    dX      = Matrix{Float64}(undef, 0, K)
+    ysel    = Bool[]
+    etaT    = Matrix{Float64}(undef, 0, 0)
+    Smax    = maximum(length.(set_of_group))
+    if mode === :binary_antithetic_simd
+        # Merge the two rows' nonzero loadings per cell into one signed list,
+        # dropping exact cancellations (both options in the same cell with the
+        # same loading, e.g. both familiar): that set carries no random part.
+        acc = Dict{Int,Float64}()
+        for s in 1:n_sets
+            lo = first(set_ranges[s]); hi = lo + 1
+            empty!(acc)
+            for k in nz_ptr[lo]:(nz_ptr[lo + 1] - 1)
+                acc[nz_loc[k]] = get(acc, nz_loc[k], 0.0) + nz_z[k]
+            end
+            for k in nz_ptr[hi]:(nz_ptr[hi + 1] - 1)
+                acc[nz_loc[k]] = get(acc, nz_loc[k], 0.0) - nz_z[k]
+            end
+            for c in sort!(collect(keys(acc)))
+                acc[c] == 0.0 && continue
+                push!(set_loc, c); push!(set_dz, acc[c])
+            end
+            set_ptr[s + 1] = length(set_loc) + 1
+        end
+        dX   = Matrix{Float64}(undef, n_sets, K)
+        ysel = Vector{Bool}(undef, n_sets)
+        for s in 1:n_sets
+            lo = first(set_ranges[s])
+            @views dX[s, :] .= xlin[lo, :] .- xlin[lo + 1, :]
+            ysel[s] = yvec[lo] == 1.0
+        end
+        etaT = Matrix{Float64}(transpose(view(eta, :, 1:H)))
+    end
+
     P = MlogitRfxPrep(
         xmatrix, xlin, zmatrix, yvec, cellloc,
         ranges, set_ranges, set_of_group, sel_row,
@@ -629,7 +729,9 @@ function _prep_mlogit_rfx(
         K, M, B, ndraws, N, Tmax, Cmax,
         terms, rfx_pairs, rfx_cols, rfx_islog, rfx_sgn, any_log,
         corr_pairs, corr_second, corr_cells, corr_names,
-        theta_names, col_id, col_group, seed, n_sets, cell_stats)
+        theta_names, col_id, col_group, seed, n_sets, cell_stats,
+        mode, binary, nz_ptr, nz_loc, nz_z,
+        H, set_ptr, set_loc, set_dz, dX, ysel, etaT, Smax)
 
     return P, gw
 end
@@ -846,18 +948,33 @@ struct MlogitRfxBuffers
     pw::Vector{Float64}      # R           posterior weights tau
     xb::Vector{Float64}      # Tmax
     ebar::Vector{Float64}    # Tmax
+    # --- :binary_antithetic_simd only (0 x 0 otherwise): draws contiguous ---
+    AT::Matrix{Float64}      # H x Cmax    per-cell coefficient, first half
+    STp::Matrix{Float64}     # H x Cmax    per-cell score, +g half
+    STm::Matrix{Float64}     # H x Cmax    per-cell score, -g half
+    Ep::Matrix{Float64}      # H x Smax    residual of the first row, +g half
+    Em::Matrix{Float64}      # H x Smax    residual of the first row, -g half
+    g::Vector{Float64}       # H           random part of one set's utility difference
 end
 
 function MlogitRfxBuffers(P::MlogitRfxPrep)
+    simd = P.kernel === :binary_antithetic_simd
+    Hs   = simd ? P.H : 0
     MlogitRfxBuffers(
-        Matrix{Float64}(undef, P.Tmax, P.R),
-        Matrix{Float64}(undef, P.Tmax, P.R),
-        Matrix{Float64}(undef, P.Cmax, P.R),
-        Matrix{Float64}(undef, P.Cmax, P.R),
+        Matrix{Float64}(undef, P.Tmax, simd ? 0 : P.R),
+        Matrix{Float64}(undef, P.Tmax, simd ? 0 : P.R),
+        Matrix{Float64}(undef, P.Cmax, simd ? 0 : P.R),
+        Matrix{Float64}(undef, P.Cmax, simd ? 0 : P.R),
         Vector{Float64}(undef, P.R),
         Vector{Float64}(undef, P.R),
         Vector{Float64}(undef, P.Tmax),
         Vector{Float64}(undef, P.Tmax),
+        Matrix{Float64}(undef, Hs, simd ? P.Cmax : 0),
+        Matrix{Float64}(undef, Hs, simd ? P.Cmax : 0),
+        Matrix{Float64}(undef, Hs, simd ? P.Cmax : 0),
+        Matrix{Float64}(undef, Hs, simd ? P.Smax : 0),
+        Matrix{Float64}(undef, Hs, simd ? P.Smax : 0),
+        Vector{Float64}(undef, Hs),
     )
 end
 
@@ -936,6 +1053,92 @@ end
 
 
 # ----------------------------------------------------------------------------
+# Two-option kernel
+# ----------------------------------------------------------------------------
+
+"""
+    _mlogit_rfx_binary_pass!(P, i, r0, Ti, Ai, Vi, Ei, Si, ll, xb, yi, want_e, scatter)
+
+Steps 2 and 3 of the fused kernel for a group whose choice sets all have exactly
+two rows: fill the linear index `Vi`, the per-draw log-likelihood `ll`, and (when
+`want_e`) the residuals `Ei` and (when `scatter`) the per-cell scores `Si`.
+
+Same likelihood as the general path, cheaper arithmetic:
+
+- The linear index adds only the nonzero loadings of each row (`P.nz_*`), in
+  term order; a zero loading contributes exactly nothing.
+- With two options the softmax is a binary logit: `P(1) = logistic(V1 - V2)`
+  and `log P(chosen) = -log1p(exp(-|d|))` (minus `|d|` on the losing side), so
+  one `exp` and one `log1p` per set and draw replace four `exp` and one `log`.
+  The residual of the second row is the negative of the first, because exactly
+  one row is selected.
+- The per-cell score accumulates the same terms as the general path.
+
+The two paths agree to roundoff (about 1e-12 relative on production data), not
+bit for bit, because the logistic form rounds differently from the max-shifted
+softmax. `test_mlogit_rfx.jl` checks the agreement.
+"""
+@inline function _mlogit_rfx_binary_pass!(P::MlogitRfxPrep, i::Int, r0::Int, Ti::Int,
+                                          Ai, Vi, Ei, Si, ll, xb, yi,
+                                          want_e::Bool, scatter::Bool)
+    R   = P.R
+    ptr = P.nz_ptr
+    loc = P.nz_loc
+    zv  = P.nz_z
+
+    @inbounds begin
+        for r in 1:R, t in 1:Ti
+            v  = xb[t]
+            tt = t + r0
+            for k in ptr[tt]:(ptr[tt + 1] - 1)
+                v += zv[k] * Ai[loc[k], r]
+            end
+            Vi[t, r] = v
+        end
+
+        scatter && fill!(Si, 0.0)
+        for r in 1:R
+            acc = P.logw[r]
+            for s in P.set_of_group[i]
+                lo = first(P.set_ranges[s]) - r0
+                hi = lo + 1
+                # Binary logit: P(1) = logistic(d), d = V1 - V2. One exp and one
+                # log1p per set and draw, on the side of d that cannot overflow.
+                d = Vi[lo, r] - Vi[hi, r]
+                if d >= 0.0
+                    ed = exp(-d)
+                    p1 = 1.0 / (1.0 + ed)
+                    lp = log1p(ed)                       # lse - V1
+                    acc += yi[lo] == 1.0 ? -lp : -(lp + d)
+                else
+                    ed = exp(d)
+                    p1 = ed / (1.0 + ed)
+                    lp = log1p(ed)                       # lse - V2
+                    acc += yi[lo] == 1.0 ? -(lp - d) : -lp
+                end
+
+                if want_e
+                    e1 = yi[lo] - p1                     # e2 = -e1 since y1 + y2 = 1
+                    Ei[lo, r] = e1
+                    Ei[hi, r] = -e1
+                    if scatter
+                        for k in ptr[lo + r0]:(ptr[lo + r0 + 1] - 1)
+                            Si[loc[k], r] += e1 * zv[k]
+                        end
+                        for k in ptr[hi + r0]:(ptr[hi + r0 + 1] - 1)
+                            Si[loc[k], r] -= e1 * zv[k]
+                        end
+                    end
+                end
+            end
+            ll[r] = acc
+        end
+    end
+    return nothing
+end
+
+
+# ----------------------------------------------------------------------------
 # Fused objective and gradient
 # ----------------------------------------------------------------------------
 
@@ -962,6 +1165,9 @@ so the extra nesting level costs O(T_i*R*M) with M small, not a factor of R.
 """
 function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
                          buf::MlogitRfxBuffers, gw::Union{Nothing, Vector{Float64}})
+
+    P.kernel === :binary_antithetic_simd &&
+        return _mlogit_rfx_fg_simd!(F, G, theta, P, buf, gw)
 
     K, M, B, R = P.K, P.M, P.B, P.R
 
@@ -1004,8 +1210,13 @@ function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
         # --- 1. per-cell coefficients ---------------------------------------
         M > 0 && _mlogit_rfx_fill_A!(Ai, beta, sigma, corr, etai, ct, cc, P)
 
-        # --- 2. linear index ------------------------------------------------
         mul!(xb, Xi, beta)
+        if P.kernel === :binary
+            # --- 2+3. two-option kernel ---------------------------------------
+            _mlogit_rfx_binary_pass!(P, i, r0, Ti, Ai, Vi, Ei, Si, buf.ll, xb, yi,
+                                     need_g, scatter)
+        else
+        # --- 2. linear index ------------------------------------------------
         if M > 0
             for r in 1:R, t in 1:Ti
                 v = xb[t]
@@ -1058,6 +1269,7 @@ function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
             end
             buf.ll[r] = acc
         end
+        end # kernel
 
         # --- 4. group log-likelihood and posterior weights over draws --------
         lse_all = logsumexp(buf.ll)
@@ -1106,6 +1318,231 @@ end
 
 
 # ----------------------------------------------------------------------------
+# Two-option, all-normal, antithetic, draw-contiguous kernel
+# ----------------------------------------------------------------------------
+
+"""
+    _mlogit_rfx_simd_pass!(P, i, theta, buf, need_g) -> nothing
+
+Likelihood pass for one group under `:binary_antithetic_simd`; fills `buf.ll`
+(all `R` draws) and, when `need_g`, the residuals `Ep`/`Em` and per-cell scores
+`STp`/`STm` for the two antithetic halves.
+
+Three facts do the work:
+
+1. **Two rows.** The softmax of a two-row set is a binary logit in the utility
+   difference `d = V1 - V2`, so each set costs one `exp` and one `log1p`, and
+   the second row's residual is minus the first's.
+2. **Antithetic draws.** `_make_cell_draws` makes draw `r + R/2` the negative of
+   draw `r`. Every term is `:normal`, so each cell coefficient flips sign with
+   its draw, and the random part `g_r` of `d` satisfies `g_{r+R/2} = -g_r`. Only
+   `g` for the first half is computed; both `d = dx + g` and `d = dx - g` are
+   then evaluated. The per-cell scores must be kept separately for the two
+   halves because the residuals differ; in the sigma/rho gradient they combine
+   as `tau_plus * S_plus - tau_minus * S_minus` since the draw itself is negated.
+3. **Draws contiguous.** `etaT`, `AT`, `ST*` and `E*` are stored with the draw
+   index first, so `g` accumulates over a contiguous vector per signed loading,
+   and the score scatter and the gradient reductions are straight loops over
+   draws that vectorise.
+
+Per set the random part of `d` uses the merged signed loadings
+`P.set_loc`/`P.set_dz` (mean below 3 entries here), and the fixed part comes from
+`P.dX * beta`, computed once per group. `dX` is first-minus-second, and `P.ysel`
+records whether the first row is the selected one.
+"""
+@inline function _mlogit_rfx_simd_pass!(P::MlogitRfxPrep, i::Int, theta::Vector{Float64},
+                                        buf::MlogitRfxBuffers, need_g::Bool)
+    K, M, B, H = P.K, P.M, P.B, P.H
+    beta  = view(theta, 1:K)
+    sigma = view(theta, K+1:K+M)
+    corr  = view(theta, K+M+1:K+M+B)
+
+    crng = P.cell_ranges[i]
+    Ci   = length(crng)
+    c0   = first(crng) - 1
+    sets = P.set_of_group[i]
+    ns   = length(sets)
+    ct   = view(P.cell_term, crng)
+    cc   = view(P.corr_cells, i, :)
+    AT   = buf.AT
+    etaT = P.etaT
+    g    = buf.g
+    ll   = buf.ll
+
+    @inbounds begin
+        # --- per-cell coefficients for the first half of the draws ----------
+        for c in 1:Ci
+            sg = sigma[ct[c]]
+            @simd for r in 1:H
+                AT[r, c] = sg * etaT[r, c0 + c]
+            end
+        end
+        for b in 1:B
+            cp, cq = cc[2b-1], cc[2b]
+            rho  = corr[b]
+            root = sqrt(1.0 - rho * rho)
+            sq   = sigma[P.corr_pairs[b][2]]
+            @simd for r in 1:H
+                AT[r, cq] = sq * (rho * etaT[r, c0 + cp] + root * etaT[r, c0 + cq])
+            end
+        end
+
+        # --- fixed part of the utility difference, one gemv per group --------
+        dx = view(buf.xb, 1:ns)
+        mul!(dx, view(P.dX, sets, :), beta)
+
+        if need_g
+            fill!(view(buf.STp, :, 1:Ci), 0.0)
+            fill!(view(buf.STm, :, 1:Ci), 0.0)
+        end
+        for r in 1:H
+            ll[r]     = P.logw[r]
+            ll[r + H] = P.logw[r + H]
+        end
+
+        for (js, s) in enumerate(sets)
+            k1 = P.set_ptr[s]
+            k2 = P.set_ptr[s + 1] - 1
+            if k1 <= k2
+                z = P.set_dz[k1]; c = P.set_loc[k1]
+                @simd for r in 1:H
+                    g[r] = z * AT[r, c]
+                end
+                for k in (k1 + 1):k2
+                    z = P.set_dz[k]; c = P.set_loc[k]
+                    @simd for r in 1:H
+                        g[r] += z * AT[r, c]
+                    end
+                end
+            else
+                fill!(g, 0.0)
+            end
+
+            y1  = P.ysel[s]
+            dxs = dx[js]
+            for r in 1:H
+                d = dxs + g[r]
+                if d >= 0.0
+                    ed = exp(-d); p1 = 1.0 / (1.0 + ed); lp = log1p(ed)
+                    ll[r] += y1 ? -lp : -(lp + d)
+                else
+                    ed = exp(d);  p1 = ed / (1.0 + ed);  lp = log1p(ed)
+                    ll[r] += y1 ? -(lp - d) : -lp
+                end
+                need_g && (buf.Ep[r, js] = (y1 ? 1.0 : 0.0) - p1)
+
+                d = dxs - g[r]
+                if d >= 0.0
+                    ed = exp(-d); p1 = 1.0 / (1.0 + ed); lp = log1p(ed)
+                    ll[r + H] += y1 ? -lp : -(lp + d)
+                else
+                    ed = exp(d);  p1 = ed / (1.0 + ed);  lp = log1p(ed)
+                    ll[r + H] += y1 ? -(lp - d) : -lp
+                end
+                need_g && (buf.Em[r, js] = (y1 ? 1.0 : 0.0) - p1)
+            end
+
+            if need_g
+                for k in k1:k2
+                    z = P.set_dz[k]; c = P.set_loc[k]
+                    @simd for r in 1:H
+                        buf.STp[r, c] += buf.Ep[r, js] * z
+                        buf.STm[r, c] += buf.Em[r, js] * z
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    _mlogit_rfx_fg_simd!(F, G, theta, P, buf, gw)
+
+`_mlogit_rfx_fg!` for `P.kernel === :binary_antithetic_simd`. See
+[`_mlogit_rfx_simd_pass!`](@ref) for the likelihood pass; the gradient collapses
+the draw dimension first, as in the general kernel, with the beta gradient
+written as `-om * dX' * ebar` over the group's choice sets.
+"""
+function _mlogit_rfx_fg_simd!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
+                              buf::MlogitRfxBuffers, gw::Union{Nothing, Vector{Float64}})
+    K, M, B, H, R = P.K, P.M, P.B, P.H, P.R
+    sigma = view(theta, K+1:K+M)
+    corr  = view(theta, K+M+1:K+M+B)
+
+    need_g = G !== nothing
+    need_g && fill!(G, 0.0)
+    gb = need_g ? view(G, 1:K)         : nothing
+    gs = need_g ? view(G, K+1:K+M)     : nothing
+    gc = need_g ? view(G, K+M+1:K+M+B) : nothing
+
+    Q = 0.0
+    @inbounds for i in 1:P.N
+        crng = P.cell_ranges[i]
+        Ci   = length(crng)
+        c0   = first(crng) - 1
+        sets = P.set_of_group[i]
+        ns   = length(sets)
+        om   = isnothing(gw) ? 1.0 : gw[i]
+        ct   = view(P.cell_term, crng)
+        cc   = view(P.corr_cells, i, :)
+
+        _mlogit_rfx_simd_pass!(P, i, theta, buf, need_g)
+
+        lse_all = logsumexp(buf.ll)
+        Q -= om * lse_all
+
+        if need_g
+            buf.pw .= exp.(buf.ll .- lse_all)
+            pwp = view(buf.pw, 1:H)
+            pwm = view(buf.pw, H+1:R)
+
+            # beta: the fixed part does not flip between halves, so the two
+            # halves' residuals ADD.
+            eb = view(buf.ebar, 1:ns)
+            mul!(eb, transpose(view(buf.Ep, :, 1:ns)), pwp)
+            mul!(eb, transpose(view(buf.Em, :, 1:ns)), pwm, 1.0, 1.0)
+            mul!(gb, transpose(view(P.dX, sets, :)), eb, -om, 1.0)
+
+            # sigma / rho: the draw flips sign in the second half, so the
+            # halves' weighted scores SUBTRACT.
+            etaT = P.etaT
+            for c in 1:Ci
+                m = ct[c]
+                b = P.corr_second[m]
+                if b == 0
+                    acc = 0.0
+                    @simd for r in 1:H
+                        acc += (pwp[r] * buf.STp[r, c] - pwm[r] * buf.STm[r, c]) *
+                               etaT[r, c0 + c]
+                    end
+                    gs[m] -= om * acc
+                else
+                    cp   = cc[2b-1]
+                    rho  = corr[b]
+                    root = sqrt(1.0 - rho * rho)
+                    rr   = rho / root
+                    acc1 = 0.0
+                    acc2 = 0.0
+                    @simd for r in 1:H
+                        co = pwp[r] * buf.STp[r, c] - pwm[r] * buf.STm[r, c]
+                        ep = etaT[r, c0 + cp]
+                        eq = etaT[r, c0 + c]
+                        acc1 += co * (rho * ep + root * eq)
+                        acc2 += co * (ep - rr * eq)
+                    end
+                    gs[m] -= om * acc1
+                    gc[b] -= om * sigma[m] * acc2
+                end
+            end
+        end
+    end
+
+    return F !== nothing ? Q : nothing
+end
+
+
+# ----------------------------------------------------------------------------
 # ESS diagnostic
 # ----------------------------------------------------------------------------
 
@@ -1129,6 +1566,16 @@ function _mlogit_rfx_ess(theta::Vector{Float64}, P::MlogitRfxPrep,
 
     ess = Vector{Float64}(undef, P.N)
 
+    if P.kernel === :binary_antithetic_simd
+        @inbounds for i in 1:P.N
+            _mlogit_rfx_simd_pass!(P, i, theta, buf, false)
+            lse = logsumexp(buf.ll)
+            buf.pw .= exp.(buf.ll .- lse)
+            ess[i] = 1.0 / sum(abs2, buf.pw)
+        end
+        return ess
+    end
+
     @inbounds for i in 1:P.N
         rrng = P.ranges[i]
         Ti   = length(rrng)
@@ -1149,6 +1596,11 @@ function _mlogit_rfx_ess(theta::Vector{Float64}, P::MlogitRfxPrep,
         M > 0 && _mlogit_rfx_fill_A!(Ai, beta, sigma, corr, etai, ct, cc, P)
 
         mul!(xb, Xi, beta)
+        if P.kernel === :binary
+            _mlogit_rfx_binary_pass!(P, i, r0, Ti, Ai, Vi, view(buf.E, 1:Ti, :),
+                                     view(buf.S, 1:Ci, :), buf.ll, xb, view(P.yvec, rrng),
+                                     false, false)
+        else
         if M > 0
             for r in 1:R, t in 1:Ti
                 v = xb[t]
@@ -1179,6 +1631,7 @@ function _mlogit_rfx_ess(theta::Vector{Float64}, P::MlogitRfxPrep,
             end
             buf.ll[r] = acc
         end
+        end # kernel
 
         lse = logsumexp(buf.ll)
         buf.pw .= exp.(buf.ll .- lse)
@@ -1456,7 +1909,8 @@ function _mlogit_rfx(
         theta0::Vector{Float64},
         gw::Union{Nothing, Vector{Float64}},
         optim_options::Optim.Options = Optim.Options();
-        rethrow_errors::Bool = false)
+        rethrow_errors::Bool = false,
+        optimizer::Optim.AbstractOptimizer = LBFGS())
 
     npar = P.K + P.M + P.B
 
@@ -1472,7 +1926,7 @@ function _mlogit_rfx(
         phi0 = _mlogit_rfx_unconstrained_start(theta0, P.K, P.M, P.B)
 
         time_it_took = @elapsed opt = optimize(
-            Optim.only_fg!(fg!), phi0, LBFGS(), optim_options)
+            Optim.only_fg!(fg!), phi0, optimizer, optim_options)
 
         th = similar(theta0)
         _mlogit_rfx_public_theta!(th, Optim.minimizer(opt), P.K, P.M, P.B)
@@ -1501,7 +1955,8 @@ function _mlogit_rfx(
                        rfx = P.rfx_pairs, rfx_cols = P.rfx_cols,
                        rfx_terms = P.terms, cell_stats = P.cell_stats,
                        rfx_corr = P.corr_pairs, corr_names = P.corr_names,
-                       seed = P.seed,
+                       seed = P.seed, kernel = P.kernel,
+                       optimizer = Optim.summary(optimizer),
                        sigma_parameterization = RFX_SIGMA_PARAMETERIZATION,
                        corr_parameterization = MLOGIT_RFX_CORR_PARAMETERIZATION,
                        ess_min = minimum(ess), ess_p10 = quantile(ess, 0.10),
@@ -1547,12 +2002,13 @@ function _mlogit_rfx_multi(P::MlogitRfxPrep, theta0s::AbstractMatrix{Float64},
                            parallel::Bool = false,
                            rethrow_errors::Bool = false,
                            warn_multi::Bool = true,
-                           obj_tol::Float64 = 1e-4)
+                           obj_tol::Float64 = 1e-4,
+                           optimizer::Optim.AbstractOptimizer = LBFGS())
 
     nstarts = size(theta0s, 1)
 
     task = r -> _mlogit_rfx(P, Vector{Float64}(view(theta0s, r, :)), gw, optim_options;
-                            rethrow_errors = rethrow_errors)
+                            rethrow_errors = rethrow_errors, optimizer = optimizer)
 
     fits = if parallel
         # The prepped simulated likelihood can be hundreds of MB at large R.
@@ -1697,6 +2153,19 @@ holding "this row's alternative", so there is nothing for a level to point at.
 - `parallel = false`: distribute a **multi-start** fit over `workers()`.
 - `rethrow_errors = false`: by default a failed optimisation is captured into
   `errored`/`error_message`; `true` lets the exception propagate.
+- `kernel = :auto`: likelihood kernel. `:general` handles any choice-set size
+  and distribution; `:binary` uses the logistic form when every choice set has
+  two rows; `:binary_antithetic_simd` additionally requires all-normal terms and
+  computes each antithetic pair of draws once with draw-contiguous storage
+  (about 4x faster than `:general` on two-option panels). `:auto` picks the most
+  specialised eligible kernel; naming an ineligible one is an error. All kernels
+  compute the same likelihood; they agree to roundoff (about 1e-13 relative),
+  not bit for bit. The resolved kernel is recorded in `extra.kernel`.
+- `optimizer = LBFGS()`: any first-order `Optim` algorithm. With about a hundred
+  parameters full `BFGS()` keeps far better curvature than the default
+  limited-memory version and has cut the number of evaluations by 5-9x on the
+  Table 2 fixed-effect specification at the same optimum; its dense matrix is
+  negligible next to one likelihood evaluation. Recorded in `extra.optimizer`.
 
 # Parameter ordering
 `theta = [mu (K, formula order); sigma (M, rfx order); corr (B, block order)]`,
@@ -1758,22 +2227,26 @@ function mlogit_rfx(
         weights::Union{Nothing, Symbol, String} = nothing,
         optim_options::Optim.Options = Optim.Options(),
         parallel::Bool = false,
-        rethrow_errors::Bool = false)
+        rethrow_errors::Bool = false,
+        kernel::Symbol = :auto,
+        optimizer::Optim.AbstractOptimizer = LBFGS())
 
     cid = Symbol(col_id)
     cg  = isnothing(col_group) ? cid : Symbol(col_group)
 
     P, gw = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
-                             ndraws, seed, weights, rfx_corr)
+                             ndraws, seed, weights, rfx_corr; kernel = kernel)
 
     theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
 
     myfit = if size(theta0s, 1) == 1
-        _mlogit_rfx(P, vec(theta0s), gw, optim_options; rethrow_errors = rethrow_errors)
+        _mlogit_rfx(P, vec(theta0s), gw, optim_options;
+                    rethrow_errors = rethrow_errors, optimizer = optimizer)
     else
         parallel && _check_boot_workers()
         _mlogit_rfx_multi(P, theta0s, gw, optim_options;
-                          parallel = parallel, rethrow_errors = rethrow_errors)
+                          parallel = parallel, rethrow_errors = rethrow_errors,
+                          optimizer = optimizer)
     end
 
     if !myfit.errored && P.M > 0 && myfit.extra.ess_p10 < 30

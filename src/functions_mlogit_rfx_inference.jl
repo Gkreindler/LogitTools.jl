@@ -42,26 +42,28 @@ end
 function _fit_mlogit_rfx_bootstrap_replicate(
         P, th_start, Wfull, b::Int, optim_options;
         per_boot_starts::Bool = false,
-        rethrow_errors::Bool = false)
+        rethrow_errors::Bool = false,
+        optimizer::Optim.AbstractOptimizer = LBFGS())
     nstart = size(th_start, 1)
     wb = Vector{Float64}(view(Wfull, :, b))
 
     if per_boot_starts && nstart == 1
         return _mlogit_rfx(P, Vector{Float64}(view(th_start, 1, :, b)), wb,
-                           optim_options; rethrow_errors = rethrow_errors)
+                           optim_options; rethrow_errors = rethrow_errors,
+                           optimizer = optimizer)
     elseif per_boot_starts
         return _mlogit_rfx_multi(P, view(th_start, :, :, b), wb, optim_options;
                                  parallel = false,
                                  rethrow_errors = rethrow_errors,
-                                 warn_multi = false)
+                                 warn_multi = false, optimizer = optimizer)
     elseif nstart == 1
         return _mlogit_rfx(P, vec(th_start), wb, optim_options;
-                           rethrow_errors = rethrow_errors)
+                           rethrow_errors = rethrow_errors, optimizer = optimizer)
     else
         return _mlogit_rfx_multi(P, th_start, wb, optim_options;
                                  parallel = false,
                                  rethrow_errors = rethrow_errors,
-                                 warn_multi = false)
+                                 warn_multi = false, optimizer = optimizer)
     end
 end
 
@@ -102,7 +104,9 @@ function fit_mlogit_rfx_bootstrap_replicate(
         cluster_var = nothing,
         theta_start = nothing,
         optim_options::Optim.Options = Optim.Options(),
-        rethrow_errors::Bool = false)
+        rethrow_errors::Bool = false,
+        kernel::Symbol = :auto,
+        optimizer::Optim.AbstractOptimizer = LBFGS())
 
     cid = Symbol(col_id)
     cg = isnothing(col_group) ? cid : Symbol(col_group)
@@ -116,7 +120,7 @@ function fit_mlogit_rfx_bootstrap_replicate(
     1 <= b <= nboot || error("replicate must lie in 1:$nboot; got $b")
 
     P, gw_user = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
-                                  ndraws, seed, weights, rfx_corr)
+                                  ndraws, seed, weights, rfx_corr; kernel = kernel)
     theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
     per_boot_starts = theta_start isa AbstractArray && ndims(theta_start) == 3
     th_start = if per_boot_starts
@@ -130,7 +134,7 @@ function fit_mlogit_rfx_bootstrap_replicate(
     return _fit_mlogit_rfx_bootstrap_replicate(
         P, th_start, Wfull, b, optim_options;
         per_boot_starts = per_boot_starts,
-        rethrow_errors = rethrow_errors)
+        rethrow_errors = rethrow_errors, optimizer = optimizer)
 end
 
 """
@@ -176,6 +180,7 @@ on.
   `errored` and the run continues. When replicates are failing, re-run with
   `parallel = false, nboot = 2, rethrow_errors = true` for a readable error.
 - `mydebug = false`: print per-replicate progress (serial path only).
+- `kernel = :auto`, `optimizer = LBFGS()`: as in [`mlogit_rfx`](@ref).
 
 # Notes
 Prep runs once on the master and rides along in the `pmap` closure, so workers
@@ -208,7 +213,9 @@ function boot_mlogit_rfx(
         on_fit = nothing,
         optim_options::Optim.Options = Optim.Options(),
         rethrow_errors::Bool = false,
-        mydebug::Bool = false)
+        mydebug::Bool = false,
+        kernel::Symbol = :auto,
+        optimizer::Optim.AbstractOptimizer = LBFGS())
 
     cid = Symbol(col_id)
     cg  = isnothing(col_group) ? cid : Symbol(col_group)
@@ -230,7 +237,7 @@ function boot_mlogit_rfx(
 
     # prep once, on the master
     P, gw_user = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
-                                  ndraws, seed, weights, rfx_corr)
+                                  ndraws, seed, weights, rfx_corr; kernel = kernel)
 
     theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
     per_boot_starts = theta_start isa AbstractArray && ndims(theta_start) == 3
@@ -257,7 +264,7 @@ function boot_mlogit_rfx(
     task = b -> _fit_mlogit_rfx_bootstrap_replicate(
         P, th_start, Wfull, b, optim_options;
         per_boot_starts = per_boot_starts,
-        rethrow_errors = rethrow_errors)
+        rethrow_errors = rethrow_errors, optimizer = optimizer)
 
     fits = if parallel
         # P can be very large at the draw counts used by mlogit_rfx. Keep one
