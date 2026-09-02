@@ -31,7 +31,8 @@ export mlogit, boot_mlogit,
 export logit2_rfx, boot_logit2_rfx, theta0_rfx, boot_report, boot_vcov!, regtable_rfx,
        rfx_level_moments, theta0_rfx_multistart
 
-export mlogit_rfx, boot_mlogit_rfx, theta0_mlogit_rfx, theta0_mlogit_rfx_multistart,
+export mlogit_rfx, boot_mlogit_rfx, fit_mlogit_rfx_bootstrap_replicate,
+       theta0_mlogit_rfx, theta0_mlogit_rfx_multistart,
        rfx_term, rfx_cell_report, RFX_SIGMA_PARAMETERIZATION,
        MLOGIT_RFX_CORR_PARAMETERIZATION
 

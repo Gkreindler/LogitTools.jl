@@ -38,6 +38,101 @@ function _pmap_rfx_streaming(task, pool::AbstractWorkerPool,
     return fits
 end
 
+"""Fit bootstrap replicate `b` from already-prepared arrays and starts."""
+function _fit_mlogit_rfx_bootstrap_replicate(
+        P, th_start, Wfull, b::Int, optim_options;
+        per_boot_starts::Bool = false,
+        rethrow_errors::Bool = false)
+    nstart = size(th_start, 1)
+    wb = Vector{Float64}(view(Wfull, :, b))
+
+    if per_boot_starts && nstart == 1
+        return _mlogit_rfx(P, Vector{Float64}(view(th_start, 1, :, b)), wb,
+                           optim_options; rethrow_errors = rethrow_errors)
+    elseif per_boot_starts
+        return _mlogit_rfx_multi(P, view(th_start, :, :, b), wb, optim_options;
+                                 parallel = false,
+                                 rethrow_errors = rethrow_errors,
+                                 warn_multi = false)
+    elseif nstart == 1
+        return _mlogit_rfx(P, vec(th_start), wb, optim_options;
+                           rethrow_errors = rethrow_errors)
+    else
+        return _mlogit_rfx_multi(P, th_start, wb, optim_options;
+                                 parallel = false,
+                                 rethrow_errors = rethrow_errors,
+                                 warn_multi = false)
+    end
+end
+
+"""
+    fit_mlogit_rfx_bootstrap_replicate(
+        data_df, formula, col_id, col_selected, theta0, replicate; kwargs...
+    ) -> MLEFit
+
+Fit one deterministic Bayesian-bootstrap replicate of [`mlogit_rfx`](@ref).
+This is the single-job counterpart to [`boot_mlogit_rfx`](@ref): it uses the
+same group-level Dirichlet weight matrix, simulation draws, start handling, and
+optimizer, but returns the selected `MLEFit` directly instead of requiring at
+least two replicates to assemble a covariance matrix. It is intended for job
+arrays in which each scheduler task owns one replicate and writes its own
+checkpoint.
+
+`replicate` must lie in `1:nboot`. A three-dimensional `theta_start` is indexed
+by the global replicate number, exactly as in `boot_mlogit_rfx`; a vector or
+matrix supplies shared single- or multi-start values. `cluster_var`, when given,
+must equal `col_group` because resampling is at the likelihood's integration
+unit. All numerical keywords have the same meaning as in `boot_mlogit_rfx`.
+"""
+function fit_mlogit_rfx_bootstrap_replicate(
+        data_df,
+        formula,
+        col_id,
+        col_selected,
+        theta0,
+        replicate::Integer;
+        col_group = nothing,
+        rfx = [],
+        rfx_corr = [],
+        ndraws::Int = 1000,
+        seed::Int = 20260808,
+        weights::Union{Nothing, Symbol, String} = nothing,
+        nboot::Int = 500,
+        boot_seed::Int = 12345,
+        cluster_var = nothing,
+        theta_start = nothing,
+        optim_options::Optim.Options = Optim.Options(),
+        rethrow_errors::Bool = false)
+
+    cid = Symbol(col_id)
+    cg = isnothing(col_group) ? cid : Symbol(col_group)
+    if !isnothing(cluster_var) && Symbol(cluster_var) != cg
+        error("cluster_var = :$(Symbol(cluster_var)) must equal col_group = :$cg. " *
+              "Clustering has to be at the integration unit.")
+    end
+
+    nboot >= 2 || error("nboot must be at least 2; got $nboot")
+    b = Int(replicate)
+    1 <= b <= nboot || error("replicate must lie in 1:$nboot; got $b")
+
+    P, gw_user = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
+                                  ndraws, seed, weights, rfx_corr)
+    theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
+    per_boot_starts = theta_start isa AbstractArray && ndims(theta_start) == 3
+    th_start = if per_boot_starts
+        _mlogit_rfx_theta0_cube(theta_start, P, nboot)
+    else
+        isnothing(theta_start) ? theta0s : _mlogit_rfx_theta0_matrix(theta_start, P)
+    end
+
+    W = _rfx_boot_weights(P.N, nboot, boot_seed)
+    Wfull = isnothing(gw_user) ? W : (W .* gw_user)
+    return _fit_mlogit_rfx_bootstrap_replicate(
+        P, th_start, Wfull, b, optim_options;
+        per_boot_starts = per_boot_starts,
+        rethrow_errors = rethrow_errors)
+end
+
 """
     boot_mlogit_rfx(data_df, formula, col_id, col_selected, theta0; kwargs...) -> MLEvcov
 
@@ -144,8 +239,6 @@ function boot_mlogit_rfx(
     else
         isnothing(theta_start) ? theta0s : _mlogit_rfx_theta0_matrix(theta_start, P)
     end
-    nstart = size(th_start, 1)
-
     boot_ids = isnothing(boot_indices) ? collect(1:nboot) :
                Int.(collect(boot_indices))
     length(boot_ids) >= 2 || error(
@@ -159,28 +252,12 @@ function boot_mlogit_rfx(
     W     = _rfx_boot_weights(P.N, nboot, boot_seed)
     Wfull = isnothing(gw_user) ? W : (W .* gw_user)
 
-    # With several starts per replicate the inner fit must run SERIALLY: the outer
-    # pmap already owns every worker, and nesting would deadlock on the same pool.
-    task = if per_boot_starts && nstart == 1
-        b -> _mlogit_rfx(P, Vector{Float64}(view(th_start, 1, :, b)),
-                         Vector{Float64}(view(Wfull, :, b)), optim_options;
-                         rethrow_errors = rethrow_errors)
-    elseif per_boot_starts
-        b -> _mlogit_rfx_multi(P, view(th_start, :, :, b),
-                               Vector{Float64}(view(Wfull, :, b)),
-                               optim_options; parallel = false,
-                               rethrow_errors = rethrow_errors,
-                               warn_multi = false)
-    elseif nstart == 1
-        ths = vec(th_start)
-        b -> _mlogit_rfx(P, ths, Vector{Float64}(view(Wfull, :, b)), optim_options;
-                         rethrow_errors = rethrow_errors)
-    else
-        b -> _mlogit_rfx_multi(P, th_start, Vector{Float64}(view(Wfull, :, b)),
-                               optim_options; parallel = false,
-                               rethrow_errors = rethrow_errors,
-                               warn_multi = false)
-    end
+    # With several starts per replicate the inner fit runs serially: the outer
+    # pmap owns every worker, and nesting would deadlock on the same pool.
+    task = b -> _fit_mlogit_rfx_bootstrap_replicate(
+        P, th_start, Wfull, b, optim_options;
+        per_boot_starts = per_boot_starts,
+        rethrow_errors = rethrow_errors)
 
     fits = if parallel
         # P can be very large at the draw counts used by mlogit_rfx. Keep one

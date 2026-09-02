@@ -859,6 +859,38 @@ end
             boot_indices = [4, 2])
         @test subset.theta_boot_table == byboot.theta_boot_table[[4, 2], :]
 
+        # A scheduler task can fit one global replicate without manufacturing a
+        # second fit merely to make a covariance matrix. It must be exactly the
+        # same fit as that row of the ordinary bootstrap, for shared or
+        # replicate-specific multi-starts.
+        single_rep = fit_mlogit_rfx_bootstrap_replicate(
+            df, _RXS, :setid, :selected, cth0, 2;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 32,
+            nboot = 4, boot_seed = 77, theta_start = cube)
+        @test single_rep.theta_hat == byboot.boot_fits[2].theta_hat
+        @test single_rep.obj_value == byboot.boot_fits[2].obj_value
+        @test single_rep.extra.n_starts == size(cube, 1)
+
+        shared_rep = fit_mlogit_rfx_bootstrap_replicate(
+            df, _RXS, :setid, :selected, cth0, 4;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 32,
+            nboot = 4, boot_seed = 77, theta_start = cstarts)
+        @test shared_rep.theta_hat == many.boot_fits[4].theta_hat
+        @test shared_rep.obj_value == many.boot_fits[4].obj_value
+
+        @test_throws ErrorException fit_mlogit_rfx_bootstrap_replicate(
+            df, _RXS, :setid, :selected, cth0, 0;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 8,
+            nboot = 4)
+        @test_throws ErrorException fit_mlogit_rfx_bootstrap_replicate(
+            df, _RXS, :setid, :selected, cth0, 5;
+            col_group = :uniqueid, rfx = crfx, rfx_corr = rc, ndraws = 8,
+            nboot = 4)
+        @test_throws ErrorException fit_mlogit_rfx_bootstrap_replicate(
+            df, _RXS, :setid, :selected, cth0, 1;
+            col_group = :uniqueid, cluster_var = :setid, rfx = crfx,
+            rfx_corr = rc, ndraws = 8, nboot = 4)
+
         # A streaming callback observes every completed fit with its global
         # replicate id, without changing result order or numerical output.
         callback_rows = Pair{Int,Float64}[]
