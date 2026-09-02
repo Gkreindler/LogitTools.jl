@@ -1115,13 +1115,33 @@ end
                                                 rfx, 64, 20260808, nothing, rc; kernel = mode))
         Pg = prep(:general); Pb = prep(:binary); Ps = prep(:binary_antithetic_simd)
         Pa = prep(:auto)
-        @test Pa.kernel === :binary_antithetic_simd
+        @test Pa.kernel === :binary_antithetic_simd && Pa.kernel_requested === :auto
+        @test Ps.kernel_requested === :binary_antithetic_simd
         @test Pg.kernel === :general && Pb.kernel === :binary
         @test Pb.binary && Ps.binary && Pg.binary       # eligibility is a data fact
-        @test Pg.eta == Ps.eta                           # same draws, same seed
-        @test Ps.etaT == permutedims(Ps.eta[:, 1:Ps.H])
+        @test Pg.eta == Pb.eta                           # same draws, same seed
+        @test Ps.etaT == permutedims(Pg.eta[:, 1:Ps.H])  # simd keeps only the first half
+        @test isempty(Ps.eta)
         @test isempty(Pg.nz_z) && isempty(Pb.set_dz) && !isempty(Ps.set_dz)
         @test minimum(length.(Pg.set_of_group)) == 1     # the one-set person survived
+        # a set whose two rows share every cell and loading merges to nothing:
+        # here option-level intercept cells differ, so construct one directly
+        dfc = copy(df)
+        dfc.alt[iseven.(dfc.setid)] .= 1                 # half the sets: both rows in one cell
+        Pc, _ = LTR._prep_mlogit_rfx(dfc, _RXS, :setid, :selected, :uniqueid,
+                                     [rfx_term(level = :alt)], 16, 3, nothing;
+                                     kernel = :binary_antithetic_simd)
+        nempty = count(Pc.set_ptr[s + 1] == Pc.set_ptr[s] for s in 1:Pc.n_sets)
+        @test 0 < nempty < Pc.n_sets                     # some sets merged away, not all
+        Pcg, _ = LTR._prep_mlogit_rfx(dfc, _RXS, :setid, :selected, :uniqueid,
+                                      [rfx_term(level = :alt)], 16, 3, nothing;
+                                      kernel = :general)
+        thc = [0.4, -0.3, 0.02, 0.7]
+        Gc = zeros(4); Gcg = zeros(4)
+        Qc  = LTR._mlogit_rfx_fg!(true, Gc,  thc, Pc,  LTR.MlogitRfxBuffers(Pc),  nothing)
+        Qcg = LTR._mlogit_rfx_fg!(true, Gcg, thc, Pcg, LTR.MlogitRfxBuffers(Pcg), nothing)
+        @test abs(Qc - Qcg) <= 1e-10 * abs(Qcg)
+        @test maximum(abs.(Gc .- Gcg) ./ max.(1.0, abs.(Gcg))) < 1e-10
 
         gw = 0.3 .+ 1.5 .* rand(MersenneTwister(4), Pg.N)
         K, M, B = Pg.K, Pg.M, Pg.B
@@ -1162,7 +1182,8 @@ end
         @test_throws ErrorException LTR._prep_mlogit_rfx(
             df3, _RXS, :setid, :selected, :uniqueid, [:x1], 16, 1, nothing; kernel = :binary)
         lrfx = [:x1 => :lognormal, rfx_term(level = :alt)]
-        Pl, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, lrfx, 16, 1, nothing)
+        Pl, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, lrfx, 16, 1, nothing;
+                                     kernel = :auto)
         @test Pl.kernel === :binary
         @test_throws ErrorException LTR._prep_mlogit_rfx(
             df, _RXS, :setid, :selected, :uniqueid, lrfx, 16, 1, nothing;
@@ -1175,9 +1196,27 @@ end
         Qlg = LTR._mlogit_rfx_fg!(true, Glg, thl, Plg, LTR.MlogitRfxBuffers(Plg), nothing)
         @test abs(Ql - Qlg) <= 1e-10 * abs(Qlg)
         @test maximum(abs.(Gl .- Glg) ./ max.(1.0, abs.(Glg))) < 1e-10
-        # M = 0 resolves to :binary
-        P0, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, [], 8, 1, nothing)
-        @test P0.kernel === :binary
+        # negative lognormal under :binary matches :general
+        nrfx = [:x2 => :neg_lognormal, rfx_term(:x1; level = :alt)]
+        Pn, _  = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, nrfx, 16, 2, nothing;
+                                      kernel = :binary)
+        Png, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, nrfx, 16, 2, nothing;
+                                      kernel = :general)
+        thn = [0.2, -0.8, 0.02, 0.5, 0.4]     # mu on the log scale for x2, negative support
+        Gn = zeros(5); Gng = zeros(5)
+        Qn  = LTR._mlogit_rfx_fg!(true, Gn,  thn, Pn,  LTR.MlogitRfxBuffers(Pn),  gw)
+        Qng = LTR._mlogit_rfx_fg!(true, Gng, thn, Png, LTR.MlogitRfxBuffers(Png), gw)
+        @test abs(Qn - Qng) <= 1e-10 * abs(Qng)
+        @test maximum(abs.(Gn .- Gng) ./ max.(1.0, abs.(Gng))) < 1e-10
+        # M = 0 resolves to :binary, and runs
+        P0, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, [], 8, 1, nothing;
+                                     kernel = :auto)
+        P0g, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, [], 8, 1, nothing)
+        @test P0.kernel === :binary && P0g.kernel === :general
+        G0 = zeros(3); G0g = zeros(3)
+        Q0  = LTR._mlogit_rfx_fg!(true, G0,  [0.4, -0.3, 0.02], P0,  LTR.MlogitRfxBuffers(P0),  gw)
+        Q0g = LTR._mlogit_rfx_fg!(true, G0g, [0.4, -0.3, 0.02], P0g, LTR.MlogitRfxBuffers(P0g), gw)
+        @test abs(Q0 - Q0g) <= 1e-12 * abs(Q0g) && maximum(abs.(G0 .- G0g)) < 1e-10
         @test_throws ErrorException LTR._prep_mlogit_rfx(
             df, _RXS, :setid, :selected, :uniqueid, [], 8, 1, nothing;
             kernel = :binary_antithetic_simd)
@@ -1197,6 +1236,17 @@ end
         @test all(f.converged for f in values(fits))
         @test fits[:general].extra.kernel === :general
         @test fits[:binary_antithetic_simd].extra.kernel === :binary_antithetic_simd
+        @test fits[:general].extra.kernel_requested === :general
+        @test fits[:general].extra.optimizer_config.m == 10
+        # the public default is the reference kernel; :auto is opt-in
+        fdef = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                          col_group = :uniqueid, rfx = rfx, rfx_corr = rc, ndraws = 64,
+                          optim_options = tight)
+        @test fdef.extra.kernel === :general && fdef.extra.kernel_requested === :general
+        fauto = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                           col_group = :uniqueid, rfx = rfx, rfx_corr = rc, ndraws = 64,
+                           kernel = :auto, optim_options = tight)
+        @test fauto.extra.kernel === :binary_antithetic_simd && fauto.extra.kernel_requested === :auto
         for mode in (:binary, :binary_antithetic_simd)
             @test abs(fits[mode].obj_value - fits[:general].obj_value) < 1e-6
             @test maximum(abs.(fits[mode].theta_hat .- fits[:general].theta_hat)) < 1e-4
@@ -1206,7 +1256,40 @@ end
                         optimizer = BFGS(), optim_options = tight)
         @test fb.converged
         @test abs(fb.obj_value - fits[:general].obj_value) < 1e-6
-        @test occursin("BFGS", fb.extra.optimizer)
+        @test occursin("BFGS", fb.extra.optimizer) && !occursin("L-BFGS", fb.extra.optimizer)
+        @test !hasproperty(fb.extra.optimizer_config, :m)
+        # multi-start and replicate-specific (3-D) starts carry the keywords through
+        ms = theta0_mlogit_rfx_multistart(_RXS, rfx; b0 = plain.theta_hat, nstarts = 2,
+                                          rfx_corr = rc, col_group = :uniqueid, seed = 5)
+        fm = mlogit_rfx(df, _RXS, :setid, :selected, ms;
+                        col_group = :uniqueid, rfx = rfx, rfx_corr = rc, ndraws = 64,
+                        kernel = :binary_antithetic_simd, optimizer = BFGS(),
+                        optim_options = tight)
+        @test fm.extra.n_starts == 2 && fm.extra.kernel === :binary_antithetic_simd
+        @test abs(fm.obj_value - fits[:general].obj_value) < 1e-6
+        cube = repeat(reshape(ms, 2, size(ms, 2), 1), 1, 1, 4)
+        vb = boot_mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                             col_group = :uniqueid, rfx = rfx, rfx_corr = rc, ndraws = 32,
+                             nboot = 4, boot_seed = 77, parallel = false, theta_start = cube,
+                             kernel = :binary_antithetic_simd, optimizer = BFGS(),
+                             optim_options = tight)
+        vg = boot_mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                             col_group = :uniqueid, rfx = rfx, rfx_corr = rc, ndraws = 32,
+                             nboot = 4, boot_seed = 77, parallel = false, theta_start = cube,
+                             optimizer = BFGS(), optim_options = tight)
+        vl = boot_mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                             col_group = :uniqueid, rfx = rfx, rfx_corr = rc, ndraws = 32,
+                             nboot = 4, boot_seed = 77, parallel = false, theta_start = cube,
+                             optim_options = tight)
+        @test all(f.extra.kernel === :binary_antithetic_simd && f.extra.n_starts == 2
+                  for f in vb.boot_fits)
+        # same optimizer, different kernel: same optimum
+        @test maximum(abs.([f.obj_value for f in vb.boot_fits] .-
+                           [f.obj_value for f in vg.boot_fits])) < 1e-6
+        # BFGS is never worse than the LBFGS default here; on one replicate it
+        # escapes a sigma = 0 boundary where LBFGS reports convergence
+        @test all(fb_.obj_value <= fl_.obj_value + 1e-8
+                  for (fb_, fl_) in zip(vg.boot_fits, vl.boot_fits))
 
         # one bootstrap replicate through the single-replicate API, both kernels
         rg = fit_mlogit_rfx_bootstrap_replicate(
@@ -1215,7 +1298,7 @@ end
             theta_start = fits[:general].theta_hat, optim_options = tight)
         rs = fit_mlogit_rfx_bootstrap_replicate(
             df, _RXS, :setid, :selected, th0, 2; col_group = :uniqueid, rfx = rfx,
-            rfx_corr = rc, ndraws = 32, nboot = 4, boot_seed = 77,
+            rfx_corr = rc, ndraws = 32, nboot = 4, boot_seed = 77, kernel = :auto,
             theta_start = fits[:general].theta_hat, optim_options = tight)
         @test rs.extra.kernel === :binary_antithetic_simd
         @test rg.weights == rs.weights

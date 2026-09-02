@@ -105,7 +105,7 @@ function fit_mlogit_rfx_bootstrap_replicate(
         theta_start = nothing,
         optim_options::Optim.Options = Optim.Options(),
         rethrow_errors::Bool = false,
-        kernel::Symbol = :auto,
+        kernel::Symbol = :general,
         optimizer::Optim.AbstractOptimizer = LBFGS())
 
     cid = Symbol(col_id)
@@ -180,7 +180,7 @@ on.
   `errored` and the run continues. When replicates are failing, re-run with
   `parallel = false, nboot = 2, rethrow_errors = true` for a readable error.
 - `mydebug = false`: print per-replicate progress (serial path only).
-- `kernel = :auto`, `optimizer = LBFGS()`: as in [`mlogit_rfx`](@ref).
+- `kernel = :general`, `optimizer = LBFGS()`: as in [`mlogit_rfx`](@ref).
 
 # Notes
 Prep runs once on the master and rides along in the `pmap` closure, so workers
@@ -214,7 +214,7 @@ function boot_mlogit_rfx(
         optim_options::Optim.Options = Optim.Options(),
         rethrow_errors::Bool = false,
         mydebug::Bool = false,
-        kernel::Symbol = :auto,
+        kernel::Symbol = :general,
         optimizer::Optim.AbstractOptimizer = LBFGS())
 
     cid = Symbol(col_id)

@@ -364,6 +364,7 @@ struct MlogitRfxPrep
     n_sets::Int
     cell_stats::Vector{NamedTuple}         # per-term identification diagnostics
     kernel::Symbol                         # resolved kernel mode, see _MLOGIT_RFX_KERNELS
+    kernel_requested::Symbol               # what the caller asked for (:auto or a mode)
     binary::Bool                           # every choice set has exactly two rows
     nz_ptr::Vector{Int}                    # Nobs+1, CSR row pointers into nz_loc / nz_z
     nz_loc::Vector{Int}                    # group-local cell of each nonzero loading
@@ -422,7 +423,7 @@ function _prep_mlogit_rfx(
         seed::Int,
         weights::Union{Nothing, Symbol, String},
         rfx_corr = [];
-        kernel::Symbol = :auto)
+        kernel::Symbol = :general)
 
     kernel in _MLOGIT_RFX_KERNELS || error(
         "kernel must be one of $(_MLOGIT_RFX_KERNELS); got :$kernel")
@@ -719,7 +720,13 @@ function _prep_mlogit_rfx(
             @views dX[s, :] .= xlin[lo, :] .- xlin[lo + 1, :]
             ysel[s] = yvec[lo] == 1.0
         end
+        # The SIMD kernel reads only the first half of the draws, transposed, and
+        # infers the antithetic second half. Keep just that copy: a prepared
+        # column-2 model is serialised to every bootstrap worker, and the full
+        # `eta` would add 50% to that traffic and to per-worker memory. The
+        # general kernel's `eta` is left empty in this mode.
         etaT = Matrix{Float64}(transpose(view(eta, :, 1:H)))
+        eta  = Matrix{Float64}(undef, 0, 0)
     end
 
     P = MlogitRfxPrep(
@@ -730,7 +737,7 @@ function _prep_mlogit_rfx(
         terms, rfx_pairs, rfx_cols, rfx_islog, rfx_sgn, any_log,
         corr_pairs, corr_second, corr_cells, corr_names,
         theta_names, col_id, col_group, seed, n_sets, cell_stats,
-        mode, binary, nz_ptr, nz_loc, nz_z,
+        mode, kernel, binary, nz_ptr, nz_loc, nz_z,
         H, set_ptr, set_loc, set_dz, dX, ysel, etaT, Smax)
 
     return P, gw
@@ -1888,6 +1895,19 @@ end
 # Estimation
 # ----------------------------------------------------------------------------
 
+"""Optimizer settings worth recording for provenance: LBFGS memory, line search."""
+function _mlogit_rfx_optimizer_config(opt)
+    cfg = Pair{Symbol,Any}[]
+    hasproperty(opt, :m) && push!(cfg, :m => getproperty(opt, :m))
+    if hasproperty(opt, :linesearch!)
+        push!(cfg, :linesearch => string(typeof(getproperty(opt, :linesearch!))))
+    end
+    if hasproperty(opt, :alphaguess!)
+        push!(cfg, :alphaguess => string(typeof(getproperty(opt, :alphaguess!))))
+    end
+    return (; cfg...)
+end
+
 """
     _mlogit_rfx(P, theta0, gw, optim_options; rethrow_errors = false) -> MLEFit
 
@@ -1955,8 +1975,11 @@ function _mlogit_rfx(
                        rfx = P.rfx_pairs, rfx_cols = P.rfx_cols,
                        rfx_terms = P.terms, cell_stats = P.cell_stats,
                        rfx_corr = P.corr_pairs, corr_names = P.corr_names,
-                       seed = P.seed, kernel = P.kernel,
+                       seed = P.seed,
+                       kernel = P.kernel, kernel_requested = P.kernel_requested,
                        optimizer = Optim.summary(optimizer),
+                       optimizer_type = string(typeof(optimizer)),
+                       optimizer_config = _mlogit_rfx_optimizer_config(optimizer),
                        sigma_parameterization = RFX_SIGMA_PARAMETERIZATION,
                        corr_parameterization = MLOGIT_RFX_CORR_PARAMETERIZATION,
                        ess_min = minimum(ess), ess_p10 = quantile(ess, 0.10),
@@ -2153,19 +2176,25 @@ holding "this row's alternative", so there is nothing for a level to point at.
 - `parallel = false`: distribute a **multi-start** fit over `workers()`.
 - `rethrow_errors = false`: by default a failed optimisation is captured into
   `errored`/`error_message`; `true` lets the exception propagate.
-- `kernel = :auto`: likelihood kernel. `:general` handles any choice-set size
-  and distribution; `:binary` uses the logistic form when every choice set has
-  two rows; `:binary_antithetic_simd` additionally requires all-normal terms and
-  computes each antithetic pair of draws once with draw-contiguous storage
-  (about 4x faster than `:general` on two-option panels). `:auto` picks the most
-  specialised eligible kernel; naming an ineligible one is an error. All kernels
-  compute the same likelihood; they agree to roundoff (about 1e-13 relative),
-  not bit for bit. The resolved kernel is recorded in `extra.kernel`.
+- `kernel = :general`: likelihood kernel. `:general` handles any choice-set
+  size and distribution and is the reference. `:binary` uses the logistic form
+  when every choice set has two rows; `:binary_antithetic_simd` additionally
+  requires all-normal terms and computes each antithetic pair of draws once with
+  draw-contiguous storage (about 4x faster than `:general` per evaluation on the
+  two-option Table 2 panel). `:auto` picks the most specialised eligible kernel;
+  naming an ineligible one is an error. All kernels compute the same likelihood
+  and agree to roundoff (about 1e-12 relative on that panel), not bit for bit,
+  so an optimiser can follow a slightly different path; the default therefore
+  stays `:general` until a run has been validated under the fast kernel. The
+  requested and resolved kernels are recorded in `extra.kernel_requested` and
+  `extra.kernel`.
 - `optimizer = LBFGS()`: any first-order `Optim` algorithm. With about a hundred
-  parameters full `BFGS()` keeps far better curvature than the default
-  limited-memory version and has cut the number of evaluations by 5-9x on the
-  Table 2 fixed-effect specification at the same optimum; its dense matrix is
-  negligible next to one likelihood evaluation. Recorded in `extra.optimizer`.
+  parameters full `BFGS()` keeps far better curvature than the limited-memory
+  default: on the Table 2 fixed-effect specification it reached the same
+  optimum in 284 evaluations where LBFGS took 1,413 iterations, and its dense
+  matrix costs nothing next to one likelihood evaluation. That is a benchmark
+  result on one model, not a guarantee. Recorded in `extra.optimizer`,
+  `extra.optimizer_type` and `extra.optimizer_config`.
 
 # Parameter ordering
 `theta = [mu (K, formula order); sigma (M, rfx order); corr (B, block order)]`,
@@ -2228,7 +2257,7 @@ function mlogit_rfx(
         optim_options::Optim.Options = Optim.Options(),
         parallel::Bool = false,
         rethrow_errors::Bool = false,
-        kernel::Symbol = :auto,
+        kernel::Symbol = :general,
         optimizer::Optim.AbstractOptimizer = LBFGS())
 
     cid = Symbol(col_id)
