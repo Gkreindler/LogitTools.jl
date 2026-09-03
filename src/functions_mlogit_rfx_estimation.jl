@@ -24,8 +24,15 @@
 #   v_cjr = sum_k xlin_cjk*beta_k + sum_m Z_cjm * A_m(cell_m(cj), r)
 #
 #   :normal         A_m(g,r) =  sigma_m*eta_m[g,r]     (mu_m enters via X'beta)
+#   :uniform        same, with eta_m ~ U(-sqrt(3), sqrt(3))       (unit variance)
+#   :triangular     same, with eta_m symmetric triangular on +-sqrt(6), mode 0
 #   :lognormal      A_m(g,r) =  exp(mu_m + sigma_m*eta_m[g,r])
 #   :neg_lognormal  A_m(g,r) = -exp(mu_m + sigma_m*eta_m[g,r])
+#
+# The three LINEAR families differ only in the draw generator (see
+# _make_cell_draws); the kernel, gradient and reporting are shared, and because
+# every eta is standardised, sigma_m is the coefficient's standard deviation
+# under each of them.
 #
 #   l_cr    = v_{c,sel(c),r} - logsumexp_{j in c} v_cjr
 #   logL_i  = logsumexp_r( sum_{c in i} l_cr + logw_r )
@@ -41,6 +48,25 @@
 # `sqrt(1-rho^2)` and its derivative from becoming singular after `tanh` rounds
 # to exactly one at a large optimiser coordinate.
 const _MLOGIT_RFX_CORR_LIMIT = 1.0 - sqrt(eps(Float64))
+
+"""
+Distributions accepted in an `mlogit_rfx` term. The three LINEAR families enter
+the utility as `sigma * eta` with `eta` standardised to mean zero and unit
+variance, so `sigma` is the coefficient's standard deviation whatever the family
+and the `sd_` rows of a table are comparable across families:
+
+    :normal      eta ~ N(0, 1)
+    :uniform     eta ~ U(-sqrt(3), sqrt(3))
+    :triangular  eta ~ symmetric triangular on (-sqrt(6), sqrt(6)) with mode 0
+
+The lognormal families are as in `logit2_rfx`. `logit2_rfx` itself still accepts
+only `_RFX_DISTS`; the bounded families are an `mlogit_rfx` extension.
+"""
+const _MLOGIT_RFX_LINEAR_DISTS = (:normal, :uniform, :triangular)
+const _MLOGIT_RFX_DISTS = (_MLOGIT_RFX_LINEAR_DISTS..., :lognormal, :neg_lognormal)
+
+"""Is `d` a linear family, i.e. `A = sigma * eta` with a standardised draw?"""
+_rfx_is_linear(d::Symbol) = d in _MLOGIT_RFX_LINEAR_DISTS
 
 """
 One random-coefficient term of an [`mlogit_rfx`](@ref) model.
@@ -75,8 +101,12 @@ Describe one random-coefficient term for [`mlogit_rfx`](@ref).
   integration unit (`col_group`), which reproduces `logit2_rfx`'s behaviour. Any
   other column gives a random effect that varies *within* an individual; draws are
   always individual-specific, i.e. the level is interacted with `col_group`.
-- `dist`: `:normal`, `:lognormal` or `:neg_lognormal`, as in [`logit2_rfx`](@ref).
-  The lognormal families need a `var` (their `mu` is an estimated formula
+- `dist`: `:normal` (default), `:uniform`, `:triangular`, `:lognormal` or
+  `:neg_lognormal`. The first three are linear in a standardised draw, so their
+  `sigma` is the coefficient's standard deviation under every one of them; a
+  bounded family only changes the shape (uniform on `mu +- sqrt(3) sigma`,
+  symmetric triangular on `mu +- sqrt(6) sigma`). The lognormal families are as
+  in [`logit2_rfx`](@ref); they need a `var` (their `mu` is an estimated formula
   coefficient), so they cannot be used for an intercept term.
 - `mean`: whether `var` must also appear in `formula` as the coefficient's fixed
   mean. The default is `true`, preserving the existing random-slope contract.
@@ -146,9 +176,9 @@ function _normalize_mlogit_rfx(rfx, formula_syms, col_group::Symbol)
                   "Got: $(repr(r))")
         end
 
-        d in _RFX_DISTS || error(
+        d in _MLOGIT_RFX_DISTS || error(
             "rfx distribution :$d is not supported (entry $j). " *
-            "Supported: $(join(string.(":", _RFX_DISTS), ", ")).")
+            "Supported: $(join(string.(":", _MLOGIT_RFX_DISTS), ", ")).")
 
         level    = isnothing(lv) ? col_group : lv
         at_group = level === col_group
@@ -209,10 +239,20 @@ end
 
 Resolve bivariate correlation blocks against the normalised random-effect terms.
 Each entry is a `Pair` or two-tuple of term names (or indices). Correlation is
-currently deliberately limited to disjoint pairs of group-level normal terms:
-that is the covariance structure needed for correlated person effects, and the
-restriction prevents a partial or non-positive-definite covariance matrix from
-being specified accidentally.
+currently deliberately limited to disjoint pairs of group-level terms of one
+linear family: that is the covariance structure needed for correlated person
+effects, and the restriction prevents a partial or non-positive-definite
+covariance matrix from being specified accidentally.
+
+Under a bounded family the block is built exactly as under the normal, as
+`A_p = sigma_p eta_p` and `A_q = sigma_q (rho eta_p + sqrt(1 - rho^2) eta_q)`
+from two independent standardised draws of that family. `sigma_p`, `sigma_q`
+and `rho` keep their meaning (marginal standard deviations and correlation),
+and the first coefficient keeps the family's exact shape, but the second is a
+weighted sum of two such draws -- a trapezoid for `:uniform` -- rather than a
+member of the family itself. Since the two draws are exchangeable in the
+likelihood only up to that shape, a caller who cares which coefficient keeps the
+exact marginal should list it first.
 
 The returned indices are ordered by term position, so writing `(a, v)` or `(v,
 a)` produces the identical finite-draw likelihood.
@@ -248,9 +288,11 @@ function _normalize_mlogit_rfx_corr(rfx_corr, terms::Vector{MlogitRfxTerm})
             "rfx_corr entry $b ($(terms[p].name), $(terms[q].name)) is not a pair of " *
             "group-level terms. Correlated blocks currently support person-level " *
             "normal coefficients only.")
-        (terms[p].dist !== :normal || terms[q].dist !== :normal) && error(
-            "rfx_corr entry $b ($(terms[p].name), $(terms[q].name)) contains a " *
-            "non-normal term. Correlation blocks require :normal coefficients.")
+        (_rfx_is_linear(terms[p].dist) && terms[p].dist === terms[q].dist) || error(
+            "rfx_corr entry $b ($(terms[p].name), $(terms[q].name)) pairs a " *
+            ":$(terms[p].dist) term with a :$(terms[q].dist) term. A correlation " *
+            "block needs two terms of the same linear family (:normal, :uniform or " *
+            ":triangular); lognormal terms cannot be correlated.")
         (!isnothing(terms[p].var) && !isnothing(terms[q].var)) || error(
             "rfx_corr entry $b contains a random intercept. A group-level intercept " *
             "cancels from every choice set and cannot be correlated meaningfully.")
@@ -271,23 +313,47 @@ end
 # ----------------------------------------------------------------------------
 
 """
-    _make_cell_draws(cells_per_group, R, seed) -> (eta, logw)
+    _rfx_standard_triangular(u) -> Float64
 
-Antithetic standard normal draws, one row per (group, term, level) **cell**:
-`eta` is `sum(cells_per_group) x R`, with the cells of group `i` occupying a
-contiguous block, in group order.
+Inverse CDF of the symmetric triangular distribution with mode 0, scaled to unit
+variance: support `(-sqrt(6), sqrt(6))`, since the triangular on `(-1, 1)` has
+variance `1/6`. `u` is a `U(0, 1)` draw.
+"""
+@inline function _rfx_standard_triangular(u::Float64)
+    return u < 0.5 ? sqrt(6.0) * (sqrt(2.0 * u) - 1.0) :
+                     sqrt(6.0) * (1.0 - sqrt(2.0 * (1.0 - u)))
+end
 
-Drawn group by group as a `C_i x R/2` block and then reflected. That ordering is
-deliberate: when every term sits at the group level `C_i == M`, and the block is
-then bit-for-bit the `randn(rng, M, R/2)` that [`_make_draws`](@ref) produces for
-`logit2_rfx`. So the two models share an RNG stream in that case and can be
-compared exactly rather than only up to simulation noise.
+"""
+    _make_cell_draws(cells_per_group, R, seed, cell_dist = nothing) -> (eta, logw)
+
+Antithetic standardised draws, one row per (group, term, level) **cell**: `eta`
+is `sum(cells_per_group) x R`, with the cells of group `i` occupying a contiguous
+block, in group order.
+
+`cell_dist`, when given, names the family of every cell (`:normal`, `:uniform`,
+`:triangular`; a lognormal cell draws a standard normal, because its randomness
+is normal on the log scale). Every family is standardised to mean zero and unit
+variance, so `sigma * eta` has standard deviation `sigma` under each.
+
+When every cell is normal (the default, and any lognormal-only extension) the
+draws are made group by group as a `C_i x R/2` block and then reflected. That
+ordering is deliberate: when every term sits at the group level `C_i == M`, and
+the block is then bit-for-bit the `randn(rng, M, R/2)` that [`_make_draws`](@ref)
+produces for `logit2_rfx`. So the two models share an RNG stream in that case
+and can be compared exactly rather than only up to simulation noise -- and every
+existing all-normal fit reproduces exactly. With a bounded family present the
+draws are made cell by cell instead, so the RNG stream of such a model is its
+own; nothing is shared with the all-normal stream.
 
 Antithetic reflection is mandatory, not optional: it is what makes the `sigma = 0`
 saddle and the `sigma -> -sigma` mirror symmetry *exact*, because column `r` and
-column `r + R/2` negate every cell together.
+column `r + R/2` negate every cell together. It is valid for the bounded families
+because both are symmetric about zero, so `-eta` has the same distribution as
+`eta`; that same symmetry is what lets the antithetic SIMD kernel handle them.
 """
-function _make_cell_draws(cells_per_group::Vector{Int}, R::Int, seed::Int)
+function _make_cell_draws(cells_per_group::Vector{Int}, R::Int, seed::Int,
+                          cell_dist::Union{Nothing, AbstractVector{Symbol}} = nothing)
     iseven(R) || error("ndraws must be even (antithetic pairing); got $R")
 
     half   = R ÷ 2
@@ -295,12 +361,36 @@ function _make_cell_draws(cells_per_group::Vector{Int}, R::Int, seed::Int)
     eta    = Matrix{Float64}(undef, ncells, R)
     rng    = MersenneTwister(seed)
 
+    if !isnothing(cell_dist)
+        length(cell_dist) == ncells || error(
+            "cell_dist has length $(length(cell_dist)) but there are $ncells cells")
+        for d in cell_dist
+            (_rfx_is_linear(d) || _rfx_is_log(d)) || error(
+                "unsupported draw family :$d; expected one of $(_MLOGIT_RFX_DISTS)")
+        end
+    end
+    all_normal = isnothing(cell_dist) ||
+                 all(d -> d === :normal || _rfx_is_log(d), cell_dist)
+
     off = 0
     for Ci in cells_per_group
-        if Ci > 0
+        if Ci > 0 && all_normal
             e = randn(rng, Ci, half)
             @views eta[off+1:off+Ci, 1:half]   .=   e
             @views eta[off+1:off+Ci, half+1:R] .= .-e
+        elseif Ci > 0
+            for c in (off + 1):(off + Ci)
+                d = cell_dist[c]
+                e = if d === :uniform
+                    sqrt(3.0) .* (2.0 .* rand(rng, half) .- 1.0)
+                elseif d === :triangular
+                    _rfx_standard_triangular.(rand(rng, half))
+                else
+                    randn(rng, half)
+                end
+                @views eta[c, 1:half]   .=   e
+                @views eta[c, half+1:R] .= .-e
+            end
         end
         off += Ci
     end
@@ -639,7 +729,11 @@ function _prep_mlogit_rfx(
     end
 
     # --- draws --------------------------------------------------------------
-    eta, logw = _make_cell_draws(cells_per_group, ndraws, seed)
+    # One family per cell, read off the cell's term. An all-normal model takes
+    # the block path inside _make_cell_draws and reproduces the pre-extension
+    # draws bit for bit.
+    cell_dist = Symbol[terms[m].dist for m in cell_term]
+    eta, logw = _make_cell_draws(cells_per_group, ndraws, seed, cell_dist)
 
     theta_names = [string.(formula_syms); ["sd_" * t.name for t in terms]; corr_names]
     rfx_pairs   = Pair{Symbol,Symbol}[Symbol(t.name) => t.dist for t in terms]
@@ -649,11 +743,14 @@ function _prep_mlogit_rfx(
     # :binary                  every set has two rows: logistic softmax, and a
     #                          per-row list of the NONZERO loadings; normal and
     #                          lognormal terms
-    # :binary_antithetic_simd  two rows AND all-normal terms: the second half
-    #                          of the antithetic draws is the negative of the
-    #                          first, so the random part of the utility
-    #                          difference is computed once per pair; draws are
-    #                          stored contiguously so the inner loops vectorise
+    # :binary_antithetic_simd  two rows AND only linear terms (normal, uniform,
+    #                          triangular): the second half of the antithetic
+    #                          draws is the negative of the first and every
+    #                          coefficient is sigma * eta, so the random part
+    #                          of the utility difference is computed once per
+    #                          pair; draws are stored contiguously so the inner
+    #                          loops vectorise. A lognormal coefficient is not
+    #                          odd in its draw, which is why it is excluded.
     # :auto picks the most specialised eligible mode. Asking for an ineligible
     # mode is an error rather than a silent fallback.
     binary  = n_sets > 0 && all(sr -> length(sr) == 2, set_ranges)
@@ -996,8 +1093,11 @@ end
 Fill `Ai` (`C_i x R`) with the quantity that multiplies the loading in the linear
 index, one row per cell of the current group:
 
-    :normal          A[c,r] = sigma_m * eta[c,r]                (deviation from mu_m)
+    linear families  A[c,r] = sigma_m * eta[c,r]                (deviation from mu_m)
     :lognormal       A[c,r] = +-exp(mu_m + sigma_m * eta[c,r])  (the coefficient itself)
+
+The linear families (`:normal`, `:uniform`, `:triangular`) differ only in how
+`eta` was drawn, so they share the first line.
 
 where `m = ct[c]` is the cell's term. `xlin` has the lognormal columns zeroed,
 which is why the second line is the whole coefficient and not a deviation. The
@@ -1325,7 +1425,7 @@ end
 
 
 # ----------------------------------------------------------------------------
-# Two-option, all-normal, antithetic, draw-contiguous kernel
+# Two-option, linear-terms-only, antithetic, draw-contiguous kernel
 # ----------------------------------------------------------------------------
 
 """
@@ -1341,7 +1441,8 @@ Three facts do the work:
    difference `d = V1 - V2`, so each set costs one `exp` and one `log1p`, and
    the second row's residual is minus the first's.
 2. **Antithetic draws.** `_make_cell_draws` makes draw `r + R/2` the negative of
-   draw `r`. Every term is `:normal`, so each cell coefficient flips sign with
+   draw `r`. Every term is linear in its draw (`:normal`, `:uniform` or
+   `:triangular`; no lognormal), so each cell coefficient flips sign with
    its draw, and the random part `g_r` of `d` satisfies `g_{r+R/2} = -g_r`. Only
    `g` for the first half is computed; both `d = dx + g` and `d = dx - g` are
    then evaluated. The per-cell scores must be kept separately for the two
@@ -2164,10 +2265,14 @@ holding "this row's alternative", so there is nothing for a level to point at.
 - `col_group = nothing`: integration unit. Defaults to `col_id`, i.e. one choice
   set per individual (the textbook cross-sectional mixed logit).
 - `rfx = []`: random-coefficient terms. `:x` and `:x => :lognormal` mean what they
-  mean in `logit2_rfx`; [`rfx_term`](@ref) adds the level and the intercept form.
-- `rfx_corr = []`: disjoint pairs of group-level normal term names whose
-  coefficients are correlated, e.g. `[(:net_value, :training)]`. Each pair adds
-  one correlation parameter. Pair order is canonicalised to formula-term order.
+  mean in `logit2_rfx`; [`rfx_term`](@ref) adds the level, the intercept form,
+  and the bounded families `:uniform` and `:triangular` (standardised, so their
+  `sigma` is the coefficient's standard deviation exactly as under `:normal`).
+- `rfx_corr = []`: disjoint pairs of group-level term names, of one linear
+  family, whose coefficients are correlated, e.g. `[(:net_value, :training)]`.
+  Each pair adds one correlation parameter. Pair order is canonicalised to
+  formula-term order. See [`_normalize_mlogit_rfx_corr`](@ref) for what the
+  block means under a bounded family.
 - `ndraws = 1000`: simulation draws, must be even (antithetic pairing).
 - `seed = 20260808`: draw seed. Draws are generated once and reused for every
   function evaluation, so the objective is a deterministic function of theta.
@@ -2179,7 +2284,7 @@ holding "this row's alternative", so there is nothing for a level to point at.
 - `kernel = :general`: likelihood kernel. `:general` handles any choice-set
   size and distribution and is the reference. `:binary` uses the logistic form
   when every choice set has two rows; `:binary_antithetic_simd` additionally
-  requires all-normal terms and computes each antithetic pair of draws once with
+  requires linear terms only (no lognormal) and computes each antithetic pair of draws once with
   draw-contiguous storage (about 4x faster than `:general` per evaluation on the
   two-option Table 2 panel). `:auto` picks the most specialised eligible kernel;
   naming an ineligible one is an error. All kernels compute the same likelihood

@@ -29,13 +29,21 @@ option-level random intercept on `:alt`.
 """
 function _mrfx_testdata(; N = 50, S = 4, J = 3, A = 4, seed = 13, ragged = false,
                           beta = nothing, sigma_g = nothing, sigma_o = nothing,
-                          sigma_net = nothing, sigma_v = nothing, rho = 0.0)
+                          sigma_net = nothing, sigma_v = nothing, rho = 0.0,
+                          family = :normal)
     rng = MersenneTwister(seed)
     rows = NamedTuple[]
     cid = 0
-    nu = randn(rng, N)
-    nv = randn(rng, N)
-    xi = randn(rng, N, A)
+    # Standardised latent draws of the requested family. The :normal branch
+    # keeps the exact pre-extension RNG calls, so every existing test data set
+    # is unchanged; the bounded families are used by the recovery test only.
+    stddraw(dims...) = family === :normal ? randn(rng, dims...) :
+        family === :uniform ? sqrt(3.0) .* (2.0 .* rand(rng, dims...) .- 1.0) :
+        family === :triangular ? LTR._rfx_standard_triangular.(rand(rng, dims...)) :
+        error("unknown family $family")
+    nu = stddraw(N)
+    nv = stddraw(N)
+    xi = stddraw(N, A)
     for i in 1:N
         Si = ragged ? max(2, S - (i % 3)) : S
         for s in 1:Si
@@ -1303,5 +1311,280 @@ end
         @test rs.extra.kernel === :binary_antithetic_simd
         @test rg.weights == rs.weights
         @test abs(rg.obj_value - rs.obj_value) < 1e-6
+    end
+
+    # -----------------------------------------------------------------------
+    @testset "bounded families: uniform and triangular" begin
+        # ---- draws ----------------------------------------------------------
+        cpg = [3, 2, 0, 4]
+        R   = 2000
+        half = R ÷ 2
+        e0, w0 = LTR._make_cell_draws(cpg, R, 11)
+        e1, _  = LTR._make_cell_draws(cpg, R, 11, fill(:normal, 9))
+        e2, _  = LTR._make_cell_draws(cpg, R, 11, [:normal, :lognormal, :normal,
+                                                   :neg_lognormal, :normal, :normal,
+                                                   :normal, :normal, :normal])
+        @test e0 == e1 == e2          # all-normal (lognormal included) keeps the block stream
+        for fam in (:uniform, :triangular)
+            e, w = LTR._make_cell_draws(cpg, R, 11, fill(fam, 9))
+            @test size(e) == (9, R)
+            @test e[:, 1:half] == .-e[:, half+1:end]
+            @test maximum(abs.(sum(e, dims = 2))) < 1e-12
+            @test all(w .== -log(R))
+            bound = fam === :uniform ? sqrt(3.0) : sqrt(6.0)
+            @test maximum(abs, e) <= bound
+            @test maximum(abs, e) > 0.9 * bound                   # the support is reached
+            @test all(abs.(vec(std(e, dims = 2; corrected = false)) .- 1.0) .< 0.06)
+            @test e != e0
+            # the fourth moment separates the shapes: 1.8 uniform, 2.4 triangular
+            # (10,000 independent draws per cell; the sampling sd of the estimate
+            # is 0.02 / 0.05, so 0.25 rejects the other family and the normal's 3)
+            ebig, _ = LTR._make_cell_draws([4], 20_000, 12, fill(fam, 4))
+            @test all(abs.(vec(mean(ebig .^ 4, dims = 2)) .- (fam === :uniform ? 1.8 : 2.4)) .< 0.25)
+        end
+        # a mixed model: each cell follows its own term's family
+        mix = [:uniform, :normal, :triangular, :uniform, :normal, :triangular,
+               :uniform, :normal, :triangular]
+        em, _ = LTR._make_cell_draws(cpg, R, 11, mix)
+        @test em[:, 1:half] == .-em[:, half+1:end]
+        for c in 1:9
+            if mix[c] === :normal
+                @test maximum(abs, em[c, :]) > sqrt(6.0)
+            else
+                @test maximum(abs, em[c, :]) <= (mix[c] === :uniform ? sqrt(3.0) : sqrt(6.0))
+            end
+        end
+        @test_throws ErrorException LTR._make_cell_draws(cpg, R, 11, fill(:uniform, 8))
+        @test_throws ErrorException LTR._make_cell_draws(cpg, R, 11, fill(:beta, 9))
+        @test_throws ErrorException LTR._make_cell_draws(cpg, 7, 11, fill(:uniform, 9))
+        # the triangular inverse CDF: symmetric, median 0, endpoints +-sqrt(6)
+        @test LTR._rfx_standard_triangular(0.5) == 0.0
+        @test LTR._rfx_standard_triangular(0.0) ≈ -sqrt(6.0)
+        @test LTR._rfx_standard_triangular(1.0 - 1e-15) ≈ sqrt(6.0) atol = 1e-6
+        @test LTR._rfx_standard_triangular(0.125) ≈ -LTR._rfx_standard_triangular(0.875)
+        @test LTR._rfx_standard_triangular(0.125) ≈ sqrt(6.0) * (0.5 - 1.0)   # F(-1/2) = 1/8
+
+        # ---- normalisation and guards ---------------------------------------
+        t = LTR._normalize_mlogit_rfx([rfx_term(:x1; dist = :uniform),
+                                       rfx_term(:x2; level = :alt, dist = :triangular),
+                                       :x3], _RXS, :uniqueid)
+        @test [u.dist for u in t] == [:uniform, :triangular, :normal]
+        @test [u.name for u in t] == ["x1", "x2|alt", "x3"]
+        @test rfx_term(:x1; dist = :uniform) == (var = :x1, level = nothing, dist = :uniform)
+        @test_throws ErrorException LTR._normalize_mlogit_rfx(
+            [rfx_term(:x1; dist = :beta)], _RXS, :uniqueid)
+        # a bounded intercept and a bounded mean-free loading are fine
+        @test length(LTR._normalize_mlogit_rfx(
+            [rfx_term(level = :alt, dist = :uniform),
+             rfx_term(:xnet; mean = false, dist = :triangular)], _RXS, :uniqueid)) == 2
+        # correlation blocks: two terms of one linear family only
+        tu = LTR._normalize_mlogit_rfx([rfx_term(:x1; dist = :uniform),
+                                        rfx_term(:x2; dist = :uniform)], _RXS, :uniqueid)
+        @test LTR._normalize_mlogit_rfx_corr([(:x1, :x2)], tu) == [(1, 2)]
+        tt = LTR._normalize_mlogit_rfx([rfx_term(:x1; dist = :triangular),
+                                        rfx_term(:x2; dist = :triangular)], _RXS, :uniqueid)
+        @test LTR._normalize_mlogit_rfx_corr([(:x2, :x1)], tt) == [(1, 2)]
+        tm = LTR._normalize_mlogit_rfx([rfx_term(:x1; dist = :uniform), :x2], _RXS, :uniqueid)
+        @test_throws ErrorException LTR._normalize_mlogit_rfx_corr([(:x1, :x2)], tm)
+        tl = LTR._normalize_mlogit_rfx([:x1 => :lognormal, :x2 => :lognormal], _RXS, :uniqueid)
+        @test_throws ErrorException LTR._normalize_mlogit_rfx_corr([(:x1, :x2)], tl)
+        # logit2_rfx does not know the bounded families
+        @test_throws ErrorException LTR._normalize_rfx([:x1 => :uniform])
+        @test_throws ErrorException LTR._normalize_rfx([:x1 => :triangular])
+        # theta0 helpers are family-agnostic for the linear families
+        rfx_u = [rfx_term(:xnet; mean = false, dist = :uniform), rfx_term(:x2; dist = :uniform),
+                 rfx_term(level = :alt, dist = :uniform), rfx_term(:x1; level = :alt, dist = :uniform)]
+        rc = [(:xnet, :x2)]
+        @test theta0_mlogit_rfx(_RXS, rfx_u; rfx_corr = rc, col_group = :uniqueid) ==
+              theta0_mlogit_rfx(_RXS, [rfx_term(:xnet; mean = false), :x2, rfx_term(level = :alt),
+                                       rfx_term(:x1; level = :alt)]; rfx_corr = rc,
+                                col_group = :uniqueid)
+        @test size(theta0_mlogit_rfx_multistart(_RXS, rfx_u; nstarts = 3, rfx_corr = rc,
+                                                col_group = :uniqueid)) == (3, 8)
+
+        # ---- prep, kernels, gradient ----------------------------------------
+        df = _mrfx_testdata(N = 30, S = 5, J = 2, A = 4, ragged = true, seed = 21)
+        first3 = minimum(df.setid[df.uniqueid .== 3])
+        df = df[.!((df.uniqueid .== 3) .& (df.setid .> first3)), :]
+        df.x3 .*= 40.0
+        rfx_n = [rfx_term(:xnet; mean = false), :x2, rfx_term(level = :alt),
+                 rfx_term(:x1; level = :alt)]
+        Pn, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid, rfx_n,
+                                     64, 20260808, nothing, rc)
+        # an all-normal prep still carries the pre-extension draws
+        en, _ = LTR._make_cell_draws([length(r) for r in Pn.cell_ranges], 64, 20260808)
+        @test Pn.eta == en
+        K, M, B = Pn.K, Pn.M, Pn.B
+        gw = 0.3 .+ 1.5 .* rand(MersenneTwister(4), Pn.N)
+        thetas = [[0.4, -0.3, 0.02, 0.65, 0.8, 0.5, 0.7, -0.55],
+                  [0.4, -0.3, 0.02, 1e-7, 0.8, 1e-7, 0.7, 0.0],        # near-zero sigmas
+                  [-1.2, 0.9, 0.05, 0.3, 0.2, 1.5, 0.1, 0.9999]]       # rho at the limit
+        Qn = LTR._mlogit_rfx_fg!(true, nothing, thetas[1], Pn, LTR.MlogitRfxBuffers(Pn), gw)
+        for fam in (:uniform, :triangular)
+            rfx_f = [rfx_term(:xnet; mean = false, dist = fam), rfx_term(:x2; dist = fam),
+                     rfx_term(level = :alt, dist = fam), rfx_term(:x1; level = :alt, dist = fam)]
+            bound = fam === :uniform ? sqrt(3.0) : sqrt(6.0)
+            prep(mode) = first(LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid,
+                                                    rfx_f, 64, 20260808, nothing, rc;
+                                                    kernel = mode))
+            Pg = prep(:general); Pb = prep(:binary); Ps = prep(:binary_antithetic_simd)
+            Pa = prep(:auto)
+            @test Pa.kernel === :binary_antithetic_simd         # linear terms are eligible
+            @test Ps.kernel === :binary_antithetic_simd && Pg.kernel === :general
+            @test maximum(abs, Pg.eta) <= bound
+            @test maximum(abs, Pg.eta) > 0.9 * bound
+            @test Pg.eta == Pb.eta
+            @test Ps.etaT == permutedims(Pg.eta[:, 1:Ps.H])
+            @test all(s.dist === fam for s in Pg.cell_stats)
+            @test Pg.rfx_pairs == [Symbol(t.name) => fam for t in Pg.terms]
+            @test Pg.theta_names == Pn.theta_names
+            @test !Pg.any_log && all(.!Pg.rfx_islog)
+
+            for th in thetas, w in (nothing, gw)
+                Gg = zeros(K+M+B); Gb = zeros(K+M+B); Gs = zeros(K+M+B)
+                Qg = LTR._mlogit_rfx_fg!(true, Gg, th, Pg, LTR.MlogitRfxBuffers(Pg), w)
+                Qb = LTR._mlogit_rfx_fg!(true, Gb, th, Pb, LTR.MlogitRfxBuffers(Pb), w)
+                Qs = LTR._mlogit_rfx_fg!(true, Gs, th, Ps, LTR.MlogitRfxBuffers(Ps), w)
+                @test isfinite(Qg)
+                @test abs(Qb - Qg) <= 1e-10 * abs(Qg)
+                @test abs(Qs - Qg) <= 1e-10 * abs(Qg)
+                @test maximum(abs.(Gb .- Gg) ./ max.(1.0, abs.(Gg))) < 1e-10
+                @test maximum(abs.(Gs .- Gg) ./ max.(1.0, abs.(Gg))) < 1e-10
+                eg = LTR._mlogit_rfx_ess(th, Pg, LTR.MlogitRfxBuffers(Pg))
+                @test maximum(abs.(LTR._mlogit_rfx_ess(th, Ps, LTR.MlogitRfxBuffers(Ps)) .- eg) ./ eg) < 1e-10
+            end
+            # analytic gradient against finite differences, both kernels, with
+            # the correlation derivative, at an interior point
+            for (P_, w) in ((Pg, gw), (Ps, gw), (Pb, nothing))
+                buf = LTR.MlogitRfxBuffers(P_)
+                th  = thetas[1]
+                G   = zeros(K+M+B); LTR._mlogit_rfx_fg!(true, G, th, P_, buf, w)
+                gn  = FiniteDiff.finite_difference_gradient(
+                    t -> LTR._mlogit_rfx_fg!(true, nothing, collect(Float64, t), P_, buf, w),
+                    th, Val{:central})
+                @test maximum(abs.(G .- gn) ./ max.(1.0, abs.(gn))) < 1e-6
+            end
+            # the family changes the likelihood: not the normal value at the same theta
+            Qf = LTR._mlogit_rfx_fg!(true, nothing, thetas[1], Pg, LTR.MlogitRfxBuffers(Pg), gw)
+            @test abs(Qf - Qn) > 1e-6
+            # sigma -> -sigma mirror symmetry (antithetic reflection), with a
+            # nonzero rho: the correlated block flips as a whole. The per-draw
+            # vector is an exact permutation; only the logsumexp re-orders a sum.
+            th_m = copy(thetas[1]); th_m[K+1:K+M] .*= -1.0
+            @test LTR._mlogit_rfx_fg!(true, nothing, th_m, Pg, LTR.MlogitRfxBuffers(Pg), gw) ≈ Qf rtol = 1e-14
+            # sigma = 0 is a stationary point in every sigma and in rho
+            th_0 = copy(thetas[1]); th_0[K+1:K+M] .= 0.0
+            G0 = zeros(K+M+B); LTR._mlogit_rfx_fg!(true, G0, th_0, Pg, LTR.MlogitRfxBuffers(Pg), gw)
+            @test maximum(abs.(G0[K+1:end])) < 1e-12
+        end
+
+        # a three-option panel (general kernel only), M = 3 with mixed families
+        P3, buf3, gw3 = _mrfx_kernel_setup(
+            rfx = [rfx_term(:x1; dist = :uniform), rfx_term(level = :alt, dist = :triangular),
+                   rfx_term(:x2; level = :alt)], weighted = true)
+        @test P3.kernel === :general && !P3.binary
+        th3 = [0.4, -0.3, 0.2, 0.7, 0.9, 0.5]
+        ga  = _mrfx_grad(P3, buf3, gw3, th3)
+        gn3 = FiniteDiff.finite_difference_gradient(_mrfx_obj(P3, buf3, gw3), th3, Val{:central})
+        @test maximum(abs.(ga .- gn3) ./ max.(1.0, abs.(gn3))) < 1e-6
+        @test _mrfx_obj(P3, buf3, gw3)(th3) ≈ _mrfx_obj(P3, buf3, gw3)([0.4, -0.3, 0.2, -0.7, -0.9, -0.5]) rtol = 1e-14
+        @test maximum(abs.(_mrfx_grad(P3, buf3, gw3, [0.4, -0.3, 0.2, 0.0, 0.0, 0.0])[4:6])) < 1e-12
+        # a uniform term next to a lognormal one: allowed, general/binary only
+        Pul, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid,
+                                      [:x1 => :lognormal, rfx_term(level = :alt, dist = :uniform)],
+                                      16, 1, nothing; kernel = :auto)
+        @test Pul.kernel === :binary
+        @test_throws ErrorException LTR._prep_mlogit_rfx(
+            df, _RXS, :setid, :selected, :uniqueid,
+            [:x1 => :lognormal, rfx_term(level = :alt, dist = :uniform)], 16, 1, nothing;
+            kernel = :binary_antithetic_simd)
+        Pulg, _ = LTR._prep_mlogit_rfx(df, _RXS, :setid, :selected, :uniqueid,
+                                       [:x1 => :lognormal, rfx_term(level = :alt, dist = :uniform)],
+                                       16, 1, nothing; kernel = :general)
+        thl = [0.2, -0.3, 0.02, 0.5, 0.4]
+        Gl = zeros(5); Glg = zeros(5)
+        Ql  = LTR._mlogit_rfx_fg!(true, Gl,  thl, Pul,  LTR.MlogitRfxBuffers(Pul),  gw)
+        Qlg = LTR._mlogit_rfx_fg!(true, Glg, thl, Pulg, LTR.MlogitRfxBuffers(Pulg), gw)
+        @test abs(Ql - Qlg) <= 1e-10 * abs(Qlg)
+        @test maximum(abs.(Gl .- Glg) ./ max.(1.0, abs.(Glg))) < 1e-10
+        gnl = FiniteDiff.finite_difference_gradient(
+            t -> LTR._mlogit_rfx_fg!(true, nothing, collect(Float64, t), Pulg,
+                                     LTR.MlogitRfxBuffers(Pulg), gw), thl, Val{:central})
+        @test maximum(abs.(Glg .- gnl) ./ max.(1.0, abs.(gnl))) < 1e-6
+
+        # ---- public API: fit, record, bootstrap, report ----------------------
+        plain = mlogit(df, _RXS, :setid, :selected, zeros(3))
+        tight = Optim.Options(g_tol = 1e-8, iterations = 5000)
+        th0 = theta0_mlogit_rfx(_RXS, rfx_u; b0 = plain.theta_hat, rfx_corr = rc,
+                                col_group = :uniqueid)
+        fu = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                        col_group = :uniqueid, rfx = rfx_u, rfx_corr = rc, ndraws = 64,
+                        kernel = :auto, optimizer = BFGS(), optim_options = tight)
+        fg = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                        col_group = :uniqueid, rfx = rfx_u, rfx_corr = rc, ndraws = 64,
+                        kernel = :general, optim_options = tight)
+        @test fu.converged && fg.converged
+        @test fu.extra.kernel === :binary_antithetic_simd
+        @test all(last(p) === :uniform for p in fu.extra.rfx)
+        @test all(s.dist === :uniform for s in fu.extra.cell_stats)
+        @test fu.theta_names == Pn.theta_names
+        @test all(fu.theta_hat[K+1:K+M] .> 0)
+        @test abs(fu.obj_value - fg.obj_value) < 1e-6
+        @test maximum(abs.(fu.theta_hat .- fg.theta_hat)) < 1e-3
+        fn = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                        col_group = :uniqueid, rfx = rfx_n, rfx_corr = rc, ndraws = 64,
+                        kernel = :auto, optimizer = BFGS(), optim_options = tight)
+        @test fn.converged && abs(fn.obj_value - fu.obj_value) > 1e-6
+        # same fit under a re-run: deterministic
+        fu2 = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                         col_group = :uniqueid, rfx = rfx_u, rfx_corr = rc, ndraws = 64,
+                         kernel = :auto, optimizer = BFGS(), optim_options = tight)
+        @test fu2.theta_hat == fu.theta_hat && fu2.obj_value == fu.obj_value
+        # bootstrap and the shared reporting layer
+        fu.vcov = boot_mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                                  col_group = :uniqueid, rfx = rfx_u, rfx_corr = rc,
+                                  ndraws = 64, nboot = 4, boot_seed = 5, parallel = false,
+                                  theta_start = fu.theta_hat, kernel = :auto,
+                                  optimizer = BFGS(), optim_options = tight)
+        @test size(fu.vcov.theta_boot_table) == (4, K+M+B)
+        @test all(f.extra.kernel === :binary_antithetic_simd for f in fu.vcov.boot_fits)
+        @test all(all(last(p) === :uniform for p in f.extra.rfx) for f in fu.vcov.boot_fits)
+        rep = boot_report(fu)
+        @test rep.param == fu.theta_names
+        @test rep.is_sd == vcat(falses(K), trues(M), falses(B))
+        @test nrow(rfx_level_moments(fu)) == 0              # no lognormal term
+        s = sprint(io -> show(io, regtable_rfx(fu; digits = 3, digits_stats = 3)))
+        @test occursin("sd_xnet", s) && occursin("cor_xnet__x2", s)
+        rb = fit_mlogit_rfx_bootstrap_replicate(
+            df, _RXS, :setid, :selected, th0, 3; col_group = :uniqueid, rfx = rfx_u,
+            rfx_corr = rc, ndraws = 64, nboot = 4, boot_seed = 5, kernel = :auto,
+            optimizer = BFGS(), theta_start = fu.theta_hat, optim_options = tight)
+        @test rb.obj_value == fu.vcov.boot_fits[3].obj_value
+        # the cell report carries the family
+        cr = rfx_cell_report(fu)
+        @test all(cr.dist .=== :uniform)
+    end
+
+    # -----------------------------------------------------------------------
+    @testset "bounded-family recovery (slow)" begin
+        # A KNOWN uniform / triangular random effect has to come back with the
+        # right standard deviation under its own family: this is what checks
+        # that the standardisation makes sigma the coefficient's SD.
+        for fam in (:uniform, :triangular)
+            df = _mrfx_testdata(N = 300, S = 6, J = 4, A = 6, seed = 2024,
+                                beta = [0.8, -0.5, 0.3], sigma_g = 0.7, sigma_o = 0.9,
+                                family = fam)
+            opts = Optim.Options(iterations = 5_000, g_tol = 1e-6)
+            rfx = [rfx_term(:x1; dist = fam), rfx_term(level = :alt, dist = fam)]
+            plain = mlogit(df, _RXS, :setid, :selected, zeros(3); optim_options = opts)
+            th0 = theta0_mlogit_rfx(_RXS, rfx; b0 = plain.theta_hat, col_group = :uniqueid)
+            fit = mlogit_rfx(df, _RXS, :setid, :selected, th0;
+                             col_group = :uniqueid, rfx = rfx, ndraws = 400,
+                             optim_options = opts)
+            @test fit.converged
+            @test maximum(abs.(fit.theta_hat[1:3] .- [0.8, -0.5, 0.3])) < 0.15
+            @test maximum(abs.(fit.theta_hat[4:5] .- [0.7, 0.9])) < 0.2
+            @test abs(plain.theta_hat[1] - 0.8) > abs(fit.theta_hat[1] - 0.8)
+        end
     end
 end
