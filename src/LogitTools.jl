@@ -34,7 +34,7 @@ export logit2_rfx, boot_logit2_rfx, theta0_rfx, boot_report, boot_vcov!, regtabl
 export mlogit_rfx, boot_mlogit_rfx, fit_mlogit_rfx_bootstrap_replicate,
        theta0_mlogit_rfx, theta0_mlogit_rfx_multistart,
        rfx_term, rfx_cell_report, RFX_SIGMA_PARAMETERIZATION,
-       MLOGIT_RFX_CORR_PARAMETERIZATION
+       MLOGIT_RFX_CORR_PARAMETERIZATION, mlogit_rfx_correlation_matrix
 
 include("MLE_objects.jl")
 

@@ -96,6 +96,7 @@ function fit_mlogit_rfx_bootstrap_replicate(
         col_group = nothing,
         rfx = [],
         rfx_corr = [],
+        rfx_corr4 = [],
         ndraws::Int = 1000,
         seed::Int = 20260808,
         weights::Union{Nothing, Symbol, String} = nothing,
@@ -120,7 +121,7 @@ function fit_mlogit_rfx_bootstrap_replicate(
     1 <= b <= nboot || error("replicate must lie in 1:$nboot; got $b")
 
     P, gw_user = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
-                                  ndraws, seed, weights, rfx_corr; kernel = kernel)
+                                  ndraws, seed, weights, rfx_corr; rfx_corr4 = rfx_corr4, kernel = kernel)
     theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
     per_boot_starts = theta_start isa AbstractArray && ndims(theta_start) == 3
     th_start = if per_boot_starts
@@ -148,7 +149,7 @@ Resampling choice sets would break the very factorisation the random effects rel
 on.
 
 # Keywords
-- `col_group`, `rfx`, `rfx_corr`, `ndraws`, `seed`, `weights`, `optim_options`: as in
+- `col_group`, `rfx`, `rfx_corr`, `rfx_corr4`, `ndraws`, `seed`, `weights`, `optim_options`: as in
   [`mlogit_rfx`](@ref). Simulation draws are held fixed across replicates.
 - `nboot = 500`: number of bootstrap replicates.
 - `boot_seed = 12345`: seed for the Dirichlet weights. With the same `boot_seed`,
@@ -201,6 +202,7 @@ function boot_mlogit_rfx(
         col_group = nothing,
         rfx = [],
         rfx_corr = [],
+        rfx_corr4 = [],
         ndraws::Int = 1000,
         seed::Int = 20260808,
         weights::Union{Nothing, Symbol, String} = nothing,
@@ -237,7 +239,7 @@ function boot_mlogit_rfx(
 
     # prep once, on the master
     P, gw_user = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
-                                  ndraws, seed, weights, rfx_corr; kernel = kernel)
+                                  ndraws, seed, weights, rfx_corr; rfx_corr4 = rfx_corr4, kernel = kernel)
 
     theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
     per_boot_starts = theta_start isa AbstractArray && ndims(theta_start) == 3
