@@ -245,6 +245,25 @@ the seed-to-seed spread is an appreciable fraction of the bootstrap standard
 error, `ndraws` is too small. There is a ready-made block at the bottom of
 `examples/example_logit2_rfx.jl`.
 
+### Two covariance blocks with a shared term
+
+`mlogit_rfx(...; rfx_corr5=[(:F, :V, :AV, :Y, :W)])` gives the ordered
+Gaussian person terms two unrestricted three-by-three covariance blocks:
+`(F,V,AV)` and `(F,Y,W)`, sharing `Var(F)`. The remaining covariances are
+completed by conditional independence of `(V,AV)` and `(Y,W)` given `F`.
+This is useful when different groups observe the two blocks and the missing
+cross-block covariances do not enter their likelihoods. It is not an
+unrestricted five-by-five covariance matrix.
+
+Each block contributes six partial correlations in addition to the five
+standard deviations already supplied by `rfx`. Pass the same `rfx_corr5`
+keyword to `theta0_mlogit_rfx` or `theta0_mlogit_rfx_multistart`. Terms must be
+distinct group-level normal slopes, and blocks must be disjoint from other
+correlation blocks. `mlogit_rfx_correlation_matrix(fit)` converts the partial
+coordinates to the complete marginal correlation matrix. The general, binary,
+and antithetic SIMD likelihood kernels support these blocks. The bootstrap
+wrapper does not yet accept `rfx_corr5`.
+
 ## Examples
 
 - `examples/example.jl` — binary logit and its bootstrap

@@ -7,4 +7,5 @@ using Test
     include("test_mlogit.jl")
     include("test_mlogit_rfx.jl")
     include("test_mlogit_rfx_corr4.jl")
+    include("test_mlogit_rfx_corr5.jl")
 end

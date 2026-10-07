@@ -281,6 +281,54 @@ function _mlogit_rfx_corr4_factors(q)
     L,J
 end
 
+# Two observable three-term blocks sharing the first term. Complete their
+# unobservable cross-covariances by conditional independence given that term.
+function _normalize_mlogit_rfx_corr5(blocks, terms, pairs, blocks4)
+    used=Set{Int}(Iterators.flatten(vcat([collect(x) for x in pairs],[collect(x) for x in blocks4])))
+    out=NTuple{5,Int}[]
+    for entry in blocks
+        entry isa Tuple && length(entry)==5 || error("rfx_corr5 needs ordered five-tuples")
+        ids=map(entry) do x
+            hits=x isa Integer ? (1<=x<=length(terms) ? [Int(x)] : Int[]) : findall(t->t.name==string(x),terms)
+            length(hits)==1 || error("rfx_corr5 term $(repr(x)) missing or ambiguous")
+            only(hits)
+        end
+        length(unique(ids))==5 || error("rfx_corr5 repeats a term")
+        for m in ids
+            m in used && error("Gaussian correlation blocks must be disjoint")
+            t=terms[m]
+            t.at_group && t.dist===:normal && !isnothing(t.var) || error("rfx_corr5 needs group-level normal slopes")
+            push!(used,m)
+        end
+        push!(out,ids)
+    end
+    out
+end
+
+# Order (F,V,AV,Y=U+V,W=AU+AV). Six partial correlations plus five marginal
+# SDs span two unrestricted 3x3 observable blocks with one common variance.
+function _mlogit_rfx_corr5_factors(q)
+    x,y,z,u,w,t=q
+    hx,hy,hz,hu,hw,ht=sqrt.(1 .- (x,y,z,u,w,t).^2)
+    dx,dy,dz,du,dw,dt=(-x/hx,-y/hy,-z/hz,-u/hu,-w/hw,-t/ht)
+    L=[1.0 0 0 0 0; x hx 0 0 0; y hy*z hy*hz 0 0; u 0 0 hu 0; w 0 0 hw*t hw*ht]
+    J=zeros(5,5,6)
+    J[2,:,1].=(1,dx,0,0,0)
+    J[3,:,2].=(1,dy*z,dy*hz,0,0)
+    J[3,:,3].=(0,hy,hy*dz,0,0)
+    J[4,:,4].=(1,0,0,du,0)
+    J[5,:,5].=(1,0,0,dw*t,dw*ht)
+    J[5,:,6].=(0,0,0,hw,hw*dt)
+    L,J
+end
+
+function _mlogit_rfx_factor_blocks(P)
+    np=length(P.corr_pairs); n4=length(P.corr4_blocks)
+    Iterators.flatten((
+        ((ids,np+5(b-1),2np+4(b-1)+1:2np+4b,3:4,5,_mlogit_rfx_corr4_factors) for (b,ids) in enumerate(P.corr4_blocks)),
+        ((ids,np+5n4+6(b-1),2np+4n4+5(b-1)+1:2np+4n4+5b,2:5,6,_mlogit_rfx_corr5_factors) for (b,ids) in enumerate(P.corr5_blocks))))
+end
+
 """
     mlogit_rfx_correlation_matrix(fit)
     mlogit_rfx_correlation_matrix(theta, prep)
@@ -290,14 +338,15 @@ in `theta` are partial correlations; this converts them to marginal correlations
 Transform each bootstrap replicate separately before calculating uncertainty.
 """
 function mlogit_rfx_correlation_matrix(theta, P)
-    _mlogit_rfx_correlation_matrix(theta, P.K, P.M, P.corr_pairs, P.corr4_blocks)
+    _mlogit_rfx_correlation_matrix(theta, P.K, P.M, P.corr_pairs, P.corr4_blocks,P.corr5_blocks)
 end
 function mlogit_rfx_correlation_matrix(fit::MLEFit)
     e = fit.extra
     blocks = hasproperty(e, :rfx_corr4) ? e.rfx_corr4 : NTuple{4,Int}[]
-    _mlogit_rfx_correlation_matrix(fit.theta_hat, e.K, e.M, e.rfx_corr, blocks)
+    b5=hasproperty(e,:rfx_corr5) ? e.rfx_corr5 : NTuple{5,Int}[]
+    _mlogit_rfx_correlation_matrix(fit.theta_hat, e.K, e.M, e.rfx_corr, blocks,b5)
 end
-function _mlogit_rfx_correlation_matrix(theta, K, M, pairs, blocks)
+function _mlogit_rfx_correlation_matrix(theta, K, M, pairs, blocks,blocks5=NTuple{5,Int}[])
     C = Matrix{Float64}(I, M, M)
     for (b,(p,q)) in enumerate(pairs)
         C[p,q] = C[q,p] = theta[K+M+b]
@@ -306,6 +355,11 @@ function _mlogit_rfx_correlation_matrix(theta, K, M, pairs, blocks)
         off = K+M+length(pairs)+5*(b-1)
         L,_ = _mlogit_rfx_corr4_factors(view(theta,off+1:off+5))
         C[collect(ids),collect(ids)] .= L*L'
+    end
+    for (b,ids) in enumerate(blocks5)
+        off=K+M+length(pairs)+5length(blocks)+6(b-1)
+        L,_=_mlogit_rfx_corr5_factors(view(theta,off+1:off+6))
+        C[collect(ids),collect(ids)].=L*L'
     end
     C
 end
@@ -508,7 +562,7 @@ struct MlogitRfxPrep
     group_ids::Vector                     # N, unique col_group values in sorted order
     K::Int
     M::Int
-    B::Int                                # total correlation coordinates (pairs + 5 per four-block)
+    B::Int                                # total coordinates (pairs + 5 per four-block + 6 per five-block)
     R::Int
     N::Int
     Tmax::Int                             # max rows per group
@@ -521,9 +575,10 @@ struct MlogitRfxPrep
     any_log::Bool
     corr_pairs::Vector{NTuple{2,Int}}     # term indices (first is the draw anchor)
     corr4_blocks::Vector{NTuple{4,Int}}   # ordered (independent1, independent2, third, fourth)
-    corr4_dependent::Vector{Bool}         # term is row 3 or 4 of a four-block
+    corr5_blocks::Vector{NTuple{5,Int}}   # two 3-term blocks sharing the first term
+    corr4_dependent::Vector{Bool}         # dependent row of a four- or five-term block
     corr_second::Vector{Int}              # term -> block index, zero unless second
-    corr_cells::Matrix{Int}               # group-local cells: 2 per pair, then 4 per four-block
+    corr_cells::Matrix{Int}               # group-local cells: 2 per pair, 4 per four-block, 5 per five-block
     corr_names::Vector{String}
     theta_names::Vector{String}
     col_id::Symbol                        # choice set
@@ -592,6 +647,7 @@ function _prep_mlogit_rfx(
         weights::Union{Nothing, Symbol, String},
         rfx_corr = [];
         rfx_corr4 = [],
+        rfx_corr5 = [],
         kernel::Symbol = :general)
 
     kernel in _MLOGIT_RFX_KERNELS || error(
@@ -605,7 +661,8 @@ function _prep_mlogit_rfx(
     M     = length(terms)
     corr_pairs = _normalize_mlogit_rfx_corr(rfx_corr, terms)
     corr4_blocks = _normalize_mlogit_rfx_corr4(rfx_corr4, terms, corr_pairs)
-    B          = length(corr_pairs) + 5length(corr4_blocks)
+    corr5_blocks=_normalize_mlogit_rfx_corr5(rfx_corr5,terms,corr_pairs,corr4_blocks)
+    B=length(corr_pairs)+5length(corr4_blocks)+6length(corr5_blocks)
 
     # --- column presence ----------------------------------------------------
     dfnames = Symbol.(names(data_df))
@@ -742,7 +799,7 @@ function _prep_mlogit_rfx(
     # A correlation block is restricted to two group-level terms, hence one
     # cell per term and group. Cache those local cell indices once rather than
     # searching `cell_term` inside every likelihood evaluation.
-    corr_cells = Matrix{Int}(undef, N, 2length(corr_pairs) + 4length(corr4_blocks))
+    corr_cells = Matrix{Int}(undef, N, 2length(corr_pairs) + 4length(corr4_blocks) + 5length(corr5_blocks))
     for (i, rg) in enumerate(ranges), (b, (p, q)) in enumerate(corr_pairs)
         corr_cells[i, 2b-1] = cellloc[first(rg), p]
         corr_cells[i, 2b]   = cellloc[first(rg), q]
@@ -750,6 +807,10 @@ function _prep_mlogit_rfx(
 
     for (i, rg) in enumerate(ranges), (b, ids) in enumerate(corr4_blocks), j in 1:4
         corr_cells[i, 2length(corr_pairs)+4(b-1)+j] = cellloc[first(rg), ids[j]]
+    end
+
+    for (i,rg) in enumerate(ranges), (b,ids) in enumerate(corr5_blocks), j in 1:5
+        corr_cells[i,2length(corr_pairs)+4length(corr4_blocks)+5(b-1)+j]=cellloc[first(rg),ids[j]]
     end
 
     # --- loadings -----------------------------------------------------------
@@ -773,6 +834,9 @@ function _prep_mlogit_rfx(
     for ids in corr4_blocks, j in 3:4
         corr4_dependent[ids[j]] = true
     end
+    for ids in corr5_blocks, j in 2:5
+        corr4_dependent[ids[j]]=true
+    end
     corr_second = zeros(Int, M)
     for (b, (_, q)) in enumerate(corr_pairs)
         corr_second[q] = b
@@ -784,6 +848,12 @@ function _prep_mlogit_rfx(
         append!(corr_names, ["pcor_$(n[3])__$(n[1])", "pcor_$(n[3])__$(n[2])_given_$(n[1])",
             "pcor_$(n[4])__$(n[1])", "pcor_$(n[4])__$(n[2])_given_$(n[1])",
             "pcor_$(n[4])__$(n[3])_given_$(n[1])_$(n[2])"])
+    end
+    for ids in corr5_blocks
+        n=[terms[m].name for m in ids]
+        append!(corr_names,["pcor_$(n[2])__$(n[1])", "pcor_$(n[3])__$(n[1])",
+            "pcor_$(n[3])__$(n[2])_given_$(n[1])", "pcor_$(n[4])__$(n[1])",
+            "pcor_$(n[5])__$(n[1])", "pcor_$(n[5])__$(n[4])_given_$(n[1])"])
     end
     xlin = xmatrix
     if any_log
@@ -926,7 +996,7 @@ function _prep_mlogit_rfx(
         cell_ranges, cell_term, eta, logw, group_ids,
         K, M, B, ndraws, N, Tmax, Cmax,
         terms, rfx_pairs, rfx_cols, rfx_islog, rfx_sgn, any_log,
-        corr_pairs, corr4_blocks, corr4_dependent, corr_second, corr_cells, corr_names,
+        corr_pairs, corr4_blocks, corr5_blocks, corr4_dependent, corr_second, corr_cells, corr_names,
         theta_names, col_id, col_group, seed, n_sets, cell_stats,
         mode, kernel, binary, nz_ptr, nz_loc, nz_z,
         H, set_ptr, set_loc, set_dz, dX, ysel, etaT, Smax)
@@ -1235,13 +1305,12 @@ their correlation. `corr_cells` supplies the two group-local draw rows.
         end
     end
 
-    for (b, ids) in enumerate(P.corr4_blocks)
-        off = length(P.corr_pairs)+5(b-1)
-        cells = view(corr_cells, 2length(P.corr_pairs)+4(b-1)+1:2length(P.corr_pairs)+4b)
-        L,_ = _mlogit_rfx_corr4_factors(view(corr,off+1:off+5))
-        for j in 3:4, r in 1:P.R
+    for (ids,off,cellrange,dependent,ncoords,factors) in _mlogit_rfx_factor_blocks(P)
+        cells = view(corr_cells, cellrange)
+        L,_ = factors(view(corr,off+1:off+ncoords))
+        for j in dependent, r in 1:P.R
             z = 0.0
-            for k in 1:4
+            for k in eachindex(ids)
                 z += L[j,k]*etai[cells[k],r]
             end
             Ai[cells[j],r] = sigma[ids[j]]*z
@@ -1405,6 +1474,7 @@ function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
         crng = P.cell_ranges[i]
         Ci   = length(crng)
         om   = isnothing(gw) ? 1.0 : gw[i]
+        om == 0 && continue
 
         Xi = view(P.xlin,    rrng, :)      # Ti x K (lognormal columns zeroed)
         Zi = view(P.zmatrix, rrng, :)      # Ti x M
@@ -1525,16 +1595,15 @@ function _mlogit_rfx_fg!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
                     end
                 end
             end
-            for (b, ids) in enumerate(P.corr4_blocks)
-                off = length(P.corr_pairs)+5(b-1)
-                cells = view(cc, 2length(P.corr_pairs)+4(b-1)+1:2length(P.corr_pairs)+4b)
-                L,J = _mlogit_rfx_corr4_factors(view(corr,off+1:off+5))
-                for j in 3:4, r in 1:R
+            for (ids,off,cellrange,dependent,ncoords,factors) in _mlogit_rfx_factor_blocks(P)
+                cells = view(cc, cellrange)
+                L,J = factors(view(corr,off+1:off+ncoords))
+                for j in dependent, r in 1:R
                     co = om*buf.pw[r]*Si[cells[j],r]
-                    z = sum(L[j,k]*etai[cells[k],r] for k in 1:4)
+                    z = sum(L[j,k]*etai[cells[k],r] for k in eachindex(ids))
                     gs[ids[j]] -= co*z
-                    for h in 1:5
-                        dz = sum(J[j,k,h]*etai[cells[k],r] for k in 1:4)
+                    for h in 1:ncoords
+                        dz = sum(J[j,k,h]*etai[cells[k],r] for k in eachindex(ids))
                         gc[off+h] -= co*sigma[ids[j]]*dz
                     end
                 end
@@ -1617,16 +1686,17 @@ records whether the first row is the selected one.
             end
         end
 
-        for (b, ids) in enumerate(P.corr4_blocks)
-            off = length(P.corr_pairs)+5(b-1)
-            cells = view(cc, 2length(P.corr_pairs)+4(b-1)+1:2length(P.corr_pairs)+4b)
-            L,_ = _mlogit_rfx_corr4_factors(view(corr,off+1:off+5))
-            for j in 3:4
-                c1,c2,c3,c4 = (c0+cells[k] for k in 1:4)
-                l1,l2,l3,l4 = (L[j,k] for k in 1:4)
-                sg = sigma[ids[j]]
+        for (ids,off,cellrange,dependent,ncoords,factors) in _mlogit_rfx_factor_blocks(P)
+            cells = view(cc, cellrange)
+            L,_ = factors(view(corr,off+1:off+ncoords))
+            for j in dependent
+                sg=sigma[ids[j]]; c=cells[j]
                 @simd for r in 1:H
-                    AT[r,cells[j]] = sg*(l1*etaT[r,c1]+l2*etaT[r,c2]+l3*etaT[r,c3]+l4*etaT[r,c4])
+                    z=0.0
+                    for k in eachindex(ids)
+                        z+=L[j,k]*etaT[r,c0+cells[k]]
+                    end
+                    AT[r,c]=sg*z
                 end
             end
         end
@@ -1728,6 +1798,7 @@ function _mlogit_rfx_fg_simd!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
         sets = P.set_of_group[i]
         ns   = length(sets)
         om   = isnothing(gw) ? 1.0 : gw[i]
+        om == 0 && continue
         ct   = view(P.cell_term, crng)
         cc   = view(P.corr_cells, i, :)
 
@@ -1780,28 +1851,31 @@ function _mlogit_rfx_fg_simd!(F, G, theta::Vector{Float64}, P::MlogitRfxPrep,
                     gc[b] -= om * sigma[m] * acc2
                 end
             end
-            for (b, ids) in enumerate(P.corr4_blocks)
-                off = length(P.corr_pairs)+5(b-1)
-                cells = view(cc, 2length(P.corr_pairs)+4(b-1)+1:2length(P.corr_pairs)+4b)
-                L,J = _mlogit_rfx_corr4_factors(view(corr,off+1:off+5))
-                for j in 3:4
-                    c = cells[j]
-                    c1,c2,c3,c4 = (c0+cells[k] for k in 1:4)
-                    l1,l2,l3,l4 = (L[j,k] for k in 1:4)
-                    acc = 0.0
+            for (ids,off,cellrange,dependent,ncoords,factors) in _mlogit_rfx_factor_blocks(P)
+                cells = view(cc, cellrange)
+                L,J = factors(view(corr,off+1:off+ncoords))
+                for j in dependent
+                    c=cells[j]; acc=0.0
                     @simd for r in 1:H
-                        co = pwp[r]*buf.STp[r,c]-pwm[r]*buf.STm[r,c]
-                        acc += co*(l1*etaT[r,c1]+l2*etaT[r,c2]+l3*etaT[r,c3]+l4*etaT[r,c4])
-                    end
-                    gs[ids[j]] -= om*acc
-                    for h in 1:5
-                        d1,d2,d3,d4 = (J[j,k,h] for k in 1:4)
-                        acc = 0.0
-                        @simd for r in 1:H
-                            co = pwp[r]*buf.STp[r,c]-pwm[r]*buf.STm[r,c]
-                            acc += co*(d1*etaT[r,c1]+d2*etaT[r,c2]+d3*etaT[r,c3]+d4*etaT[r,c4])
+                        z=0.0
+                        for k in eachindex(ids)
+                            z+=L[j,k]*etaT[r,c0+cells[k]]
                         end
-                        gc[off+h] -= om*sigma[ids[j]]*acc
+                        co=pwp[r]*buf.STp[r,c]-pwm[r]*buf.STm[r,c]
+                        acc+=co*z
+                    end
+                    gs[ids[j]]-=om*acc
+                    for h in 1:ncoords
+                        acc=0.0
+                        @simd for r in 1:H
+                            z=0.0
+                            for k in eachindex(ids)
+                                z+=J[j,k,h]*etaT[r,c0+cells[k]]
+                            end
+                            co=pwp[r]*buf.STp[r,c]-pwm[r]*buf.STm[r,c]
+                            acc+=co*z
+                        end
+                        gc[off+h]-=om*sigma[ids[j]]*acc
                     end
                 end
             end
@@ -1969,14 +2043,16 @@ function theta0_mlogit_rfx(formula, rfx;
                            s0 = fill(0.5, length(rfx)),
                            rfx_corr = [],
                            rfx_corr4 = [],
-                           corr0 = fill(0.0, length(rfx_corr)+5length(rfx_corr4)),
+        rfx_corr5 = [],
+                           corr0 = fill(0.0, length(rfx_corr)+5length(rfx_corr4)+6length(rfx_corr5)),
                            col_group::Symbol = :__group__)
 
     K = length(formula)
     M = length(rfx)
     terms = _normalize_mlogit_rfx(rfx, Symbol.(formula), col_group)
     pairs = _normalize_mlogit_rfx_corr(rfx_corr, terms)
-    B = length(pairs)+5length(_normalize_mlogit_rfx_corr4(rfx_corr4, terms, pairs))
+    b4=_normalize_mlogit_rfx_corr4(rfx_corr4,terms,pairs)
+    B=length(pairs)+5length(b4)+6length(_normalize_mlogit_rfx_corr5(rfx_corr5,terms,pairs,b4))
 
     length(b0) == K || error("b0 has length $(length(b0)) but formula has $K variables")
     length(s0) == M || error("s0 has length $(length(s0)) but rfx has $M terms")
@@ -2031,7 +2107,8 @@ function theta0_mlogit_rfx_multistart(formula, rfx;
                                       s_range = (0.05, 2.0),
                                       rfx_corr = [],
                            rfx_corr4 = [],
-                                      corr0 = fill(0.0, length(rfx_corr)+5length(rfx_corr4)),
+        rfx_corr5 = [],
+                                      corr0 = fill(0.0, length(rfx_corr)+5length(rfx_corr4)+6length(rfx_corr5)),
                                       corr_range = (-0.8, 0.8),
                                       b_jitter::Real = 0.0,
                                       seed::Int = 20260808,
@@ -2047,14 +2124,15 @@ function theta0_mlogit_rfx_multistart(formula, rfx;
 
     terms = _normalize_mlogit_rfx(rfx, Symbol.(formula), col_group)
     pairs = _normalize_mlogit_rfx_corr(rfx_corr, terms)
-    B = length(pairs)+5length(_normalize_mlogit_rfx_corr4(rfx_corr4, terms, pairs))
+    b4=_normalize_mlogit_rfx_corr4(rfx_corr4,terms,pairs)
+    B=length(pairs)+5length(b4)+6length(_normalize_mlogit_rfx_corr5(rfx_corr5,terms,pairs,b4))
     length(corr0) == B || error(
         "corr0 has length $(length(corr0)) but the correlation specification has $B coordinates")
     K, M = length(formula), length(rfx)
     rng  = MersenneTwister(seed)
 
     out = Matrix{Float64}(undef, nstarts, K + M + B)
-    out[1, :] .= theta0_mlogit_rfx(formula, rfx; b0 = b0, rfx_corr = rfx_corr, rfx_corr4 = rfx_corr4,
+    out[1, :] .= theta0_mlogit_rfx(formula, rfx; b0 = b0, rfx_corr = rfx_corr, rfx_corr4 = rfx_corr4, rfx_corr5 = rfx_corr5,
                                    corr0 = corr0, col_group = col_group)
 
     for r in 2:nstarts
@@ -2062,7 +2140,7 @@ function theta0_mlogit_rfx_multistart(formula, rfx;
         c = B == 0 ? Float64[] : clo .+ (chi - clo) .* rand(rng, B)
         b = b_jitter > 0 ? collect(Float64, b0) .* exp.(b_jitter .* randn(rng, K)) : b0
         out[r, :] .= theta0_mlogit_rfx(formula, rfx; b0 = b, s0 = s,
-                                       rfx_corr = rfx_corr, rfx_corr4 = rfx_corr4, corr0 = c,
+                                       rfx_corr = rfx_corr, rfx_corr4 = rfx_corr4, rfx_corr5 = rfx_corr5, corr0 = c,
                                        col_group = col_group)
     end
 
@@ -2241,7 +2319,7 @@ function _mlogit_rfx(
                        n_sets = P.n_sets,
                        rfx = P.rfx_pairs, rfx_cols = P.rfx_cols,
                        rfx_terms = P.terms, cell_stats = P.cell_stats,
-                       rfx_corr = P.corr_pairs, rfx_corr4 = P.corr4_blocks, corr_names = P.corr_names,
+                       rfx_corr = P.corr_pairs, rfx_corr4 = P.corr4_blocks, rfx_corr5 = P.corr5_blocks, corr_names = P.corr_names,
                        seed = P.seed,
                        kernel = P.kernel, kernel_requested = P.kernel_requested,
                        optimizer = Optim.summary(optimizer),
@@ -2534,6 +2612,7 @@ function mlogit_rfx(
         rfx = [],
         rfx_corr = [],
         rfx_corr4 = [],
+        rfx_corr5 = [],
         ndraws::Int = 1000,
         seed::Int = 20260808,
         weights::Union{Nothing, Symbol, String} = nothing,
@@ -2547,7 +2626,7 @@ function mlogit_rfx(
     cg  = isnothing(col_group) ? cid : Symbol(col_group)
 
     P, gw = _prep_mlogit_rfx(data_df, formula, cid, col_selected, cg, rfx,
-                             ndraws, seed, weights, rfx_corr; rfx_corr4 = rfx_corr4, kernel = kernel)
+                             ndraws, seed, weights, rfx_corr; rfx_corr4 = rfx_corr4, rfx_corr5 = rfx_corr5, kernel = kernel)
 
     theta0s = _mlogit_rfx_theta0_matrix(theta0, P)
 
