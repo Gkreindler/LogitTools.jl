@@ -148,11 +148,20 @@ and block coordinates inside `(-1, 1)` (scaled `tanh`). An estimate can sit at
 the boundary, e.g. a standard deviation near zero. At that point the
 transformation is flat and an optimiser started there cannot move, so starting
 standard deviations below `sd_start_min = 0.01` are raised to it and
-coordinates are clipped to `+-corr_start_max = 0.99`. This affects starting
+coordinates are clipped to `+-corr_start_max = 0.9`. This affects starting
 values only. A boundary estimate has no regular curvature; `mlogit_rfx_vcov`
 with `fixed = mlogit_rfx_boundary(...)` gives the sandwich with those
 parameters held at their values. Neither the sandwich nor the bootstrap is
 valid for a parameter at the boundary itself.
+
+**Spurious boundary optima.** A block coordinate `z` enters the draws through
+`sqrt(1 - z^2)`, whose slope is infinite at `z = +-1`. The exact likelihood is
+smooth there, but the simulated one has a small noise term in that direction,
+which can make `z = +-1` a local minimum even when the best fit is interior.
+Starts close to +-1 can then get stuck at the boundary (in one test, a start at
+0.99 did and a start at 0.9 did not). Use several starts, including some with
+interior correlations, whenever a coordinate is estimated near +-1. This
+includes bootstrap replicates, where the warm start sits at the estimate.
 
 **Simulation.** Draws are pseudo-random and antithetic (draw `r + R/2` is minus
 draw `r`), generated once in `mlogit_rfx_prep` from `seed` and held fixed, so

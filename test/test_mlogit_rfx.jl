@@ -274,9 +274,13 @@ theta_for(P; seed = 5) = (rng = MersenneTwister(seed);
                         ndraws = 200)
         @test f2.obj_value ≈ fit.obj_value rtol = 1e-8
 
-        # a start at the boundary is moved inside, and still converges
+        # a start at the boundary is moved inside and converges; with other
+        # starts the best fit is unchanged (a boundary start alone can stop at a
+        # spurious boundary optimum, see the README)
         th = copy(fit.theta_hat); th[5] = 1e-12; th[end] = 1 - 1e-9
-        @test mlogit_rfx_fit(P, th).obj_value ≈ fit.obj_value rtol = 1e-6
+        fb = mlogit_rfx_fit(P, th)
+        @test fb.converged && fb.obj_value >= fit.obj_value - 1e-6
+        @test mlogit_rfx_fit(P, vcat(th', starts)).obj_value ≈ fit.obj_value rtol = 1e-8
 
         # lognormal starting values are levels
         th0 = theta0_mlogit_rfx([:x1, :xpos], [:xpos => :neg_lognormal]; b0 = [0.1, -2.0], s0 = 0.5)
@@ -312,7 +316,8 @@ theta_for(P; seed = 5) = (rng = MersenneTwister(seed);
         # multi-start within each replicate
         ms = boot_mlogit_rfx(P, vcat(th', theta0_mlogit_rfx(P)'); W = W[:, 1:2])
         @test all(nrow(f.fits_df) == 2 for f in ms.boot_fits)
-        @test all(ms.theta_boot_table[b, :] ≈ bt.theta_boot_table[b, :] for b in 1:2)
+        # the first start is the warm start, so multi-start can only do better
+        @test all(ms.boot_fits[b].obj_value <= bt.boot_fits[b].obj_value + 1e-8 for b in 1:2)
     end
 
     # Starts worker processes, so it runs only on request:

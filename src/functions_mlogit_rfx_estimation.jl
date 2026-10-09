@@ -1351,10 +1351,13 @@ the gap to the next optimum, and the effective number of draws.
 - `weights = nothing`: group weights, multiplied with the prep's weights.
 - `optimizer = BFGS()`, `optim_options = Optim.Options()`: passed to Optim.
 - `parallel = false`: distribute the starts over `workers()`.
-- `sd_start_min = 0.01`, `corr_start_max = 0.99`: starting standard deviations
+- `sd_start_min = 0.01`, `corr_start_max = 0.9`: starting standard deviations
   are raised to at least `sd_start_min`, and block coordinates are clipped to
   `[-corr_start_max, corr_start_max]`. At an exact boundary the optimiser could
-  not move (see the README). Only starting values are affected.
+  not move. Near +-1 a coordinate enters through `sqrt(1 - z^2)`, whose slope
+  is infinite at the boundary, so with finite draws the simulated objective can
+  have a spurious local minimum at +-1 that traps starts close to it (see the
+  README). Only starting values are affected.
 - `rethrow_errors = false`: by default a failed start is recorded in
   `fits_df` rather than thrown.
 - `ess = true`: compute effective draws at the estimate (one extra pass).
@@ -1365,7 +1368,7 @@ function mlogit_rfx_fit(P::MlogitRfxPrep, theta0;
                         optim_options::Optim.Options = Optim.Options(),
                         parallel::Bool = false,
                         sd_start_min::Real = 0.01,
-                        corr_start_max::Real = 0.99,
+                        corr_start_max::Real = 0.9,
                         rethrow_errors::Bool = false,
                         ess::Bool = true)
     starts = _mrfx_starts(theta0, P)
