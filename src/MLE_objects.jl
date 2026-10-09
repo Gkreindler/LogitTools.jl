@@ -25,6 +25,9 @@ Base.@kwdef mutable struct MLEFit
 
     # variance covariance matrix
     vcov = nothing
+
+    # model-specific diagnostics (e.g. mlogit_rfx effective draws, start counts)
+    extra = nothing
 end
 
 Base.@kwdef mutable struct MLEvcov
