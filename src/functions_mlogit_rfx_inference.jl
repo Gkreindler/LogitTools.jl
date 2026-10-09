@@ -176,9 +176,11 @@ function boot_mlogit_rfx(P::MlogitRfxPrep, starts;
     size(W, 1) == P.N || error("W must have one row per group ($(P.N))")
     S = _mrfx_starts(starts, P)
 
-    task = b -> mlogit_rfx_fit(P, S; weights = W[:, b], parallel = false, ess = false,
-                               fit_kwargs...)
-    fits = parallel ? _mrfx_pmap(task, 1:size(W, 2)) : map(task, 1:size(W, 2))
+    fit_replicate = (d, b) -> mlogit_rfx_fit(d.P, d.S; weights = d.W[:, b], parallel = false,
+                                             ess = false, fit_kwargs...)
+    data = (; P, S, W)
+    ids = 1:size(W, 2)
+    fits = parallel ? _mrfx_pmap(fit_replicate, data, ids) : [fit_replicate(data, b) for b in ids]
 
     table = permutedims(reduce(hcat, [f.theta_hat for f in fits]))
     good  = [!f.errored && f.converged for f in fits]

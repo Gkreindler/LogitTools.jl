@@ -1273,14 +1273,31 @@ function _mrfx_check_workers()
     return nothing
 end
 
-"""Map `task` over `ids` on all workers, shipping its closure once per worker."""
-function _mrfx_pmap(task, ids)
+# Data sent to each worker once per parallel call, looked up by key.
+const _MRFX_SHARED = Dict{UInt64, Any}()
+_mrfx_share!(key::UInt64, data) = (_MRFX_SHARED[key] = data; nothing)
+_mrfx_unshare!(key::UInt64) = (delete!(_MRFX_SHARED, key); nothing)
+
+"""
+    _mrfx_pmap(f, data, ids)
+
+`[f(data, id) for id in ids]`, distributed over `workers()`. `data` (the
+prepared model, which can be large) is sent to every worker once, before the
+map, and released afterwards; each task then carries only its `id` and `f`, so
+`f` must not capture `data` itself.
+"""
+function _mrfx_pmap(f, data, ids)
     _mrfx_check_workers()
-    pool = CachingPool(workers())
+    key = rand(RandomDevice(), UInt64)
+    @sync for wk in workers()
+        @async remotecall_wait(_mrfx_share!, wk, key, data)
+    end
     try
-        return pmap(task, pool, ids)
+        return pmap(id -> f(_MRFX_SHARED[key], id), ids)
     finally
-        clear!(pool)
+        @sync for wk in workers()
+            @async remotecall_wait(_mrfx_unshare!, wk, key)
+        end
     end
 end
 
@@ -1353,10 +1370,12 @@ function mlogit_rfx_fit(P::MlogitRfxPrep, theta0;
                         ess::Bool = true)
     starts = _mrfx_starts(theta0, P)
     w = _mrfx_weights(P, weights)
-    task = s -> _mrfx_fit_one(P, starts[s, :], w, optim_options, optimizer,
-                              Float64(sd_start_min), Float64(corr_start_max), rethrow_errors)
+    sd_min, corr_max = Float64(sd_start_min), Float64(corr_start_max)
+    fit_start = (d, s) -> _mrfx_fit_one(d.P, d.starts[s, :], d.w, optim_options, optimizer,
+                                        sd_min, corr_max, rethrow_errors)
+    data = (; P, starts, w)
     ids = 1:size(starts, 1)
-    results = parallel ? _mrfx_pmap(task, ids) : map(task, ids)
+    results = parallel ? _mrfx_pmap(fit_start, data, ids) : [fit_start(data, s) for s in ids]
     fit = _mrfx_assemble(P, starts, results, w)
 
     if ess && !fit.errored && P.M > 0

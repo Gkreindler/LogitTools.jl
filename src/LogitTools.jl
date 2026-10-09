@@ -16,7 +16,7 @@ using RegressionTables, StatsAPI, Vcov
 
 using Random          # MersenneTwister
 using Statistics      # median, quantile
-using Distributed     # pmap, CachingPool, workers
+using Distributed     # pmap, remotecall_wait, workers
 
 export mlogit, boot_mlogit,
        logit2, boot_logit2,

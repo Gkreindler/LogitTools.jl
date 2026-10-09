@@ -330,6 +330,15 @@ theta_for(P; seed = 5) = (rng = MersenneTwister(seed);
                 W = mlogit_rfx_boot_weights(P.N, 4)
                 @test boot_mlogit_rfx(P, th; W, parallel = true).theta_boot_table ==
                       boot_mlogit_rfx(P, th; W).theta_boot_table
+                # repeated parallel calls with different prepared models
+                for rfx in ([:a], [:a, :b, rfx_term(:x1; level = :nbh)], [:b])
+                    Q = prep(df; rfx)
+                    s = theta0_mlogit_rfx_multistart(Q; nstarts = 2)
+                    @test mlogit_rfx_fit(Q, s; parallel = true).theta_hat ==
+                          mlogit_rfx_fit(Q, s).theta_hat
+                end
+                @test all(isempty(remotecall_fetch(() -> LogitTools._MRFX_SHARED, wk))
+                          for wk in workers())     # nothing left on the workers
             finally
                 rmprocs(procs_)
             end
