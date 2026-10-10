@@ -17,6 +17,7 @@ using RegressionTables, StatsAPI, Vcov
 using Random          # MersenneTwister
 using Statistics      # median, quantile
 using Distributed     # pmap, remotecall_wait, workers
+using Serialization   # sending prepared models to workers through a file
 
 export mlogit, boot_mlogit,
        logit2, boot_logit2,

@@ -1273,28 +1273,41 @@ function _mrfx_check_workers()
     return nothing
 end
 
-# Data sent to each worker once per parallel call, looked up by key.
+# Data loaded on each worker once per parallel call, looked up by key.
 const _MRFX_SHARED = Dict{UInt64, Any}()
-_mrfx_share!(key::UInt64, data) = (_MRFX_SHARED[key] = data; nothing)
-_mrfx_unshare!(key::UInt64) = (delete!(_MRFX_SHARED, key); nothing)
+_mrfx_load_shared!(key::UInt64, path::String) = (_MRFX_SHARED[key] = deserialize(path); nothing)
+_mrfx_unshare!(key::UInt64) = (delete!(_MRFX_SHARED, key); GC.gc(); nothing)
 
 """
     _mrfx_pmap(f, data, ids)
 
-`[f(data, id) for id in ids]`, distributed over `workers()`. `data` (the
-prepared model, which can be large) is sent to every worker once, before the
-map, and released afterwards; each task then carries only its `id` and `f`, so
-`f` must not capture `data` itself.
+`[f(data, id) for id in ids]`, distributed over `workers()`; `f` must not
+capture `data` itself.
+
+`data` (the prepared model, up to several GB with many draws) is written once to
+a temporary file, which every worker reads before the map; each task then
+carries only `f` and its `id`. Afterwards every worker drops its copy and
+collects garbage, so repeated calls (e.g. bootstrap chunks) do not accumulate
+copies. Streaming large objects to several workers over their sockets at once
+failed intermittently (corrupted deserialization), and old copies awaiting
+garbage collection exhausted memory. The file is written to
+`ENV["LOGITTOOLS_SHARED_DIR"]` if set, else `tempdir()`; it must be readable by
+all workers (the default works when they run on the same machine).
 """
 function _mrfx_pmap(f, data, ids)
     _mrfx_check_workers()
-    key = rand(RandomDevice(), UInt64)
-    @sync for wk in workers()
-        @async remotecall_wait(_mrfx_share!, wk, key, data)
-    end
+    key  = rand(RandomDevice(), UInt64)
+    path = joinpath(get(ENV, "LOGITTOOLS_SHARED_DIR", tempdir()),
+                    "logittools_shared_$(string(key, base = 16)).jls")
     try
+        serialize(path, data)
+        @sync for wk in workers()
+            @async remotecall_wait(_mrfx_load_shared!, wk, key, path)
+        end
+        rm(path; force = true)
         return pmap(id -> f(_MRFX_SHARED[key], id), ids)
     finally
+        rm(path; force = true)
         @sync for wk in workers()
             @async remotecall_wait(_mrfx_unshare!, wk, key)
         end
